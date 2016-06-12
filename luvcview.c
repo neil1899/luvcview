@@ -179,7 +179,8 @@ act_title title_act[A_LAST] ={
    { A_LOAD, "Restored Configuration" }
 };
 static const char version[] = VERSION;
-struct vdIn *videoIn;
+struct vdIn *videoIn_left;
+struct vdIn *videoIn_right;
 
 /* Translates screen coordinates into buttons */
 action_gui
@@ -194,14 +195,34 @@ struct pt_data {
     struct vdIn *ptvideoIn;
     float frmrate;
     SDL_mutex *affmutex;
-} ptdata;
+} pt_left_data, pt_right_data;
 
-static int eventThread(void *data);
-static Uint32 SDL_VIDEO_Flags =
+static int eventThread_left(void *data);
+static int eventThread_right(void *data);
+
+static Uint32 SDL_VIDEO_LEFT_Flags =
     SDL_ANYFORMAT | SDL_DOUBLEBUF | SDL_RESIZABLE;
-    
 
-int main(int argc, char *argv[])
+static Uint32 SDL_VIDEO_RIGHT_Flags =
+    SDL_ANYFORMAT | SDL_DOUBLEBUF | SDL_RESIZABLE;
+
+int grabmethod = 1;
+int hwaccel = 0;
+const char *mode = NULL;
+int format = V4L2_PIX_FMT_MJPEG;
+char *sizestring = NULL;
+int width = 640;
+int height = 360;
+float fps = 60.0;			// Requested frame rate
+char *separateur;
+int queryformats = 0;
+int querycontrols = 0;
+int readconfigfile = 0;
+int enableRawStreamCapture = 0;
+int enableRawFrameCapture = 0;
+char *fpsstring  = NULL;
+
+void *sdl_left(void *ptr)
 {
 	const SDL_VideoInfo *info;
 	char driver[128];
@@ -216,39 +237,438 @@ int main(int argc, char *argv[])
 	Uint32 currtime;
 	Uint32 lasttime;
 	unsigned char *p = NULL;
-	int hwaccel = 0;
-	const char *videodevice = NULL;
-	const char *mode = NULL;
-	int format = V4L2_PIX_FMT_MJPEG;
-	int i;
-	int grabmethod = 1;
-	int width = 640;
-	int height = 360;
-	float fps = 60.0;			// Requested frame rate
+	const char *videodevice = "/dev/video0";
+
 	float frmrate = 0.0;		// Measured frame rate
 	char *avifilename = NULL;
-	int queryformats = 0;
-	int querycontrols = 0;
-	int readconfigfile = 0;
-	char *separateur;
-	char *sizestring = NULL;
-	char *fpsstring  = NULL;
-	int enableRawStreamCapture = 0;
-	int enableRawFrameCapture = 0;
+
+	/************* Test SDL capabilities ************/
+	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+		fprintf(stderr, "Couldn't initialize SDL: %s\n", SDL_GetError());
+		exit(1);
+	}
+
+	/* For this version, we'll be save and disable hardware acceleration */
+	if(hwaccel)
+		if ( ! getenv("SDL_VIDEO_YUV_HWACCEL") ) {
+			putenv("SDL_VIDEO_YUV_HWACCEL=0");
+		}
+
+	printf("SDL information:\n");
+	if (SDL_VideoDriverName(driver, sizeof(driver))) {
+		printf("  Video driver: %s\n", driver);
+	}
+	info = SDL_GetVideoInfo();
+
+	if (info->wm_available) {
+		printf("  A window manager is available\n");
+	}
+	if (info->hw_available) {
+		printf("  Hardware surfaces are available (%dk video memory)\n",
+				info->video_mem);
+		SDL_VIDEO_LEFT_Flags |= SDL_HWSURFACE;
+	}
+	if (info->blit_hw) {
+		printf("  Copy blits between hardware surfaces are accelerated\n");
+		SDL_VIDEO_LEFT_Flags |= SDL_ASYNCBLIT;
+	}
+	if (info->blit_hw_CC) {
+		printf
+			("  Colorkey blits between hardware surfaces are accelerated\n");
+	}
+	if (info->blit_hw_A) {
+		printf("  Alpha blits between hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw) {
+		printf
+			("  Copy blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw_CC) {
+		printf
+			("  Colorkey blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw_A) {
+		printf
+			("  Alpha blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_fill) {
+		printf("  Color fills on hardware surfaces are accelerated\n");
+	}
+
+	if (!(SDL_VIDEO_LEFT_Flags & SDL_HWSURFACE))
+		SDL_VIDEO_LEFT_Flags |= SDL_SWSURFACE;
+
+	if (avifilename == NULL || *avifilename == 0) {
+		avifilename = "video_left.avi";
+	}
+
+	videoIn_left = (struct vdIn *) calloc(1, sizeof(struct vdIn));
+	if ( queryformats ) {
+		/* if we're supposed to list the video formats, do that now and go out */
+		check_videoIn(videoIn_left,(char *) videodevice);
+		free(videoIn_left);
+		SDL_Quit();
+		exit(1);
+	}
+	if (init_videoIn
+			(videoIn_left, (char *) videodevice, width, height, fps, format,
+			 grabmethod, avifilename) < 0)
+		exit(1);
+	/* if we're supposed to list the controls, do that now */
+	if ( querycontrols )
+		enum_controls(videoIn_left->fd);
+
+	/* if we're supposed to read the control settings from a configfile, do that now */
+	if ( readconfigfile )
+		load_controls(videoIn_left->fd);
+
+	pscreen =
+		SDL_SetVideoMode(videoIn_left->width, videoIn_left->height + 32, 0,
+				SDL_VIDEO_LEFT_Flags);
+
+	overlay =
+		SDL_CreateYUVOverlay(videoIn_left->width, videoIn_left->height + 32,
+				SDL_YUY2_OVERLAY, pscreen);
+	p = (unsigned char *) overlay->pixels[0];
+	drect.x = 0;
+	drect.y = 0;
+	drect.w = pscreen->w;
+	drect.h = pscreen->h;
+	if (enableRawStreamCapture) {
+		videoIn_left->captureFile = fopen("stream_left.raw", "wb");
+		if(videoIn_left->captureFile == NULL) {
+			perror("Unable to open file for raw stream capturing");
+		} else {
+			printf("Starting raw stream capturing to stream.raw ...\n");
+		}
+	}
+	if (enableRawFrameCapture)
+		videoIn_left->rawFrameCapture = enableRawFrameCapture;
+
+	initLut();
+	SDL_WM_SetCaption(title_act[A_VIDEO].title, NULL);
+	lasttime = SDL_GetTicks();
+	creatButt(videoIn_left->width, 32);
+	SDL_LockYUVOverlay(overlay);
+	memcpy(p + (videoIn_left->width * (videoIn_left->height) * 2), YUYVbutt,
+			videoIn_left->width * 64);
+	SDL_UnlockYUVOverlay(overlay);
+	/* initialize thread data */
+	pt_left_data.ptscreen = &pscreen;
+	pt_left_data.ptvideoIn = videoIn_left;
+	pt_left_data.ptsdlevent = &sdlevent;
+	pt_left_data.drect = &drect;
+	affmutex = SDL_CreateMutex();
+	pt_left_data.affmutex = affmutex;
+	mythread = SDL_CreateThread(eventThread_left, (void *) &pt_left_data);
+
+	// Initialize frame rate calculator
+	int loop_counter = 0;
+	const int frmrate_update = videoIn_left->fps / 2;
+	lasttime = SDL_GetTicks();	// [ms]
+
+	/* main big loop */
+	while (videoIn_left->signalquit) {
+		// Measure the frame rate every (fps/2) frames
+		if(loop_counter ++ % frmrate_update == 0)
+		{
+			currtime = SDL_GetTicks();	// [ms]
+			if (currtime - lasttime > 0) {
+				frmrate = frmrate_update * (1000.0 / (currtime - lasttime));
+			}
+			lasttime = currtime;
+		}
+
+		if (uvcGrab(videoIn_left) < 0) {
+			printf("Error grabbing\n");
+			break;
+		}
+
+		/* if we're grabbing video, show the frame rate */
+		if (videoIn_left->toggleAvi)
+			printf("\rframe rate: %g     ", frmrate);
+
+		SDL_LockYUVOverlay(overlay);
+		memcpy(p, videoIn_left->framebuffer,
+				videoIn_left->width * (videoIn_left->height) * 2);
+		SDL_UnlockYUVOverlay(overlay);
+		SDL_DisplayYUVOverlay(overlay, &drect);
+
+		if (videoIn_left->getPict) {
+			switch(videoIn_left->formatIn){
+				case V4L2_PIX_FMT_MJPEG:
+					get_picture(videoIn_left->tmpbuffer,videoIn_left->buf.bytesused);
+					break;
+				case V4L2_PIX_FMT_YUYV:
+					get_pictureYV2(videoIn_left->framebuffer,videoIn_left->width,videoIn_left->height);
+					break;
+				default:
+					break;
+			}
+			videoIn_left->getPict = 0;
+			printf("get picture !\n");
+		}
+
+		SDL_LockMutex(affmutex);
+		pt_left_data.frmrate = frmrate;
+		SDL_WM_SetCaption(videoIn_left->status, NULL);
+		SDL_UnlockMutex(affmutex);
+		//SDL_Delay(10);
+
+	}
+	SDL_WaitThread(mythread, &status);
+	SDL_DestroyMutex(affmutex);
+
+	/* if avifile is defined, we made a video: compute the exact fps and
+	   set it in the video */
+	if (videoIn_left->avifile != NULL) {
+		float fps=(videoIn_left->framecount/(videoIn_left->recordtime/1000));
+		fprintf(stderr,"setting fps to %f\n",fps);
+		AVI_set_video(videoIn_left->avifile, videoIn_left->width, videoIn_left->height,
+				fps, "MJPG");
+		AVI_close(videoIn_left->avifile);
+	}
+
+	close_v4l2(videoIn_left);
+	free(videoIn_left);
+	destroyButt();
+	freeLut();
+	printf("Cleanup done. Exiting ...\n");
+	SDL_Quit();
+}
+
+void *sdl_right(void *ptr)
+{
+	const SDL_VideoInfo *info;
+	char driver[128];
+	SDL_Surface *pscreen;
+	SDL_Overlay *overlay;
+	SDL_Rect drect;
+	SDL_Event sdlevent;
+	SDL_Thread *mythread;
+	SDL_mutex *affmutex;
+
+	int status;
+	Uint32 currtime;
+	Uint32 lasttime;
+	unsigned char *p = NULL;
+	const char *videodevice = "/dev/video1";
+
+	float frmrate = 0.0;		// Measured frame rate
+	char *avifilename = NULL;
+
+	/************* Test SDL capabilities ************/
+	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+		fprintf(stderr, "Couldn't initialize SDL: %s\n", SDL_GetError());
+		exit(1);
+	}
+
+	/* For this version, we'll be save and disable hardware acceleration */
+	if(hwaccel)
+		if ( ! getenv("SDL_VIDEO_YUV_HWACCEL") ) {
+			putenv("SDL_VIDEO_YUV_HWACCEL=0");
+		}
+
+	printf("SDL information:\n");
+	if (SDL_VideoDriverName(driver, sizeof(driver))) {
+		printf("  Video driver: %s\n", driver);
+	}
+	info = SDL_GetVideoInfo();
+
+	if (info->wm_available) {
+		printf("  A window manager is available\n");
+	}
+	if (info->hw_available) {
+		printf("  Hardware surfaces are available (%dk video memory)\n",
+				info->video_mem);
+		SDL_VIDEO_RIGHT_Flags |= SDL_HWSURFACE;
+	}
+	if (info->blit_hw) {
+		printf("  Copy blits between hardware surfaces are accelerated\n");
+		SDL_VIDEO_RIGHT_Flags |= SDL_ASYNCBLIT;
+	}
+	if (info->blit_hw_CC) {
+		printf
+			("  Colorkey blits between hardware surfaces are accelerated\n");
+	}
+	if (info->blit_hw_A) {
+		printf("  Alpha blits between hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw) {
+		printf
+			("  Copy blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw_CC) {
+		printf
+			("  Colorkey blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_sw_A) {
+		printf
+			("  Alpha blits from software surfaces to hardware surfaces are accelerated\n");
+	}
+	if (info->blit_fill) {
+		printf("  Color fills on hardware surfaces are accelerated\n");
+	}
+
+	if (!(SDL_VIDEO_RIGHT_Flags & SDL_HWSURFACE))
+		SDL_VIDEO_RIGHT_Flags |= SDL_SWSURFACE;
+
+	if (avifilename == NULL || *avifilename == 0) {
+		avifilename = "video_right.avi";
+	}
+
+	videoIn_right = (struct vdIn *) calloc(1, sizeof(struct vdIn));
+	if ( queryformats ) {
+		/* if we're supposed to list the video formats, do that now and go out */
+		check_videoIn(videoIn_right,(char *) videodevice);
+		free(videoIn_right);
+		SDL_Quit();
+		exit(1);
+	}
+	if (init_videoIn
+			(videoIn_right, (char *) videodevice, width, height, fps, format,
+			 grabmethod, avifilename) < 0)
+		exit(1);
+	/* if we're supposed to list the controls, do that now */
+	if ( querycontrols )
+		enum_controls(videoIn_right->fd);
+
+	/* if we're supposed to read the control settings from a configfile, do that now */
+	if ( readconfigfile )
+		load_controls(videoIn_right->fd);
+
+	pscreen =
+		SDL_SetVideoMode(videoIn_right->width, videoIn_right->height + 32, 0,
+				SDL_VIDEO_RIGHT_Flags);
+
+	overlay =
+		SDL_CreateYUVOverlay(videoIn_right->width, videoIn_right->height + 32,
+				SDL_YUY2_OVERLAY, pscreen);
+	p = (unsigned char *) overlay->pixels[0];
+	drect.x = 0;
+	drect.y = 0;
+	drect.w = pscreen->w;
+	drect.h = pscreen->h;
+	if (enableRawStreamCapture) {
+		videoIn_right->captureFile = fopen("stream_right.raw", "wb");
+		if(videoIn_right->captureFile == NULL) {
+			perror("Unable to open file for raw stream capturing");
+		} else {
+			printf("Starting raw stream capturing to stream.raw ...\n");
+		}
+	}
+	if (enableRawFrameCapture)
+		videoIn_right->rawFrameCapture = enableRawFrameCapture;
+
+	initLut();
+
+	SDL_WM_SetCaption(title_act[A_VIDEO].title, NULL);
+	lasttime = SDL_GetTicks();
+	creatButt(videoIn_right->width, 32);
+	SDL_LockYUVOverlay(overlay);
+	memcpy(p + (videoIn_right->width * (videoIn_right->height) * 2), YUYVbutt,
+			videoIn_right->width * 64);
+	SDL_UnlockYUVOverlay(overlay);
+	/* initialize thread data */
+	pt_right_data.ptscreen = &pscreen;
+	pt_right_data.ptvideoIn = videoIn_right;
+	pt_right_data.ptsdlevent = &sdlevent;
+	pt_right_data.drect = &drect;
+	affmutex = SDL_CreateMutex();
+	pt_right_data.affmutex = affmutex;
+	mythread = SDL_CreateThread(eventThread_right, (void *) &pt_right_data);
+
+	// Initialize frame rate calculator
+	int loop_counter = 0;
+	const int frmrate_update = videoIn_right->fps / 2;
+	lasttime = SDL_GetTicks();	// [ms]
+
+	/* main big loop */
+	while (videoIn_right->signalquit) {
+		// Measure the frame rate every (fps/2) frames
+		if(loop_counter ++ % frmrate_update == 0)
+		{
+			currtime = SDL_GetTicks();	// [ms]
+			if (currtime - lasttime > 0) {
+				frmrate = frmrate_update * (1000.0 / (currtime - lasttime));
+			}
+			lasttime = currtime;
+		}
+
+		if (uvcGrab(videoIn_right) < 0) {
+			printf("Error grabbing\n");
+			break;
+		}
+
+		/* if we're grabbing video, show the frame rate */
+		if (videoIn_right->toggleAvi)
+			printf("\rframe rate: %g     ", frmrate);
+
+		SDL_LockYUVOverlay(overlay);
+		memcpy(p, videoIn_right->framebuffer,
+				videoIn_right->width * (videoIn_right->height) * 2);
+		SDL_UnlockYUVOverlay(overlay);
+		SDL_DisplayYUVOverlay(overlay, &drect);
+
+		if (videoIn_right->getPict) {
+			switch(videoIn_right->formatIn){
+				case V4L2_PIX_FMT_MJPEG:
+					get_picture(videoIn_right->tmpbuffer,videoIn_right->buf.bytesused);
+					break;
+				case V4L2_PIX_FMT_YUYV:
+					get_pictureYV2(videoIn_right->framebuffer,videoIn_right->width,videoIn_right->height);
+					break;
+				default:
+					break;
+			}
+			videoIn_right->getPict = 0;
+			printf("get picture !\n");
+		}
+
+		SDL_LockMutex(affmutex);
+		pt_right_data.frmrate = frmrate;
+		SDL_WM_SetCaption(videoIn_right->status, NULL);
+		SDL_UnlockMutex(affmutex);
+		//SDL_Delay(10);
+
+	}
+	SDL_WaitThread(mythread, &status);
+	SDL_DestroyMutex(affmutex);
+
+	/* if avifile is defined, we made a video: compute the exact fps and
+	   set it in the video */
+	if (videoIn_right->avifile != NULL) {
+		float fps=(videoIn_right->framecount/(videoIn_right->recordtime/1000));
+		fprintf(stderr,"setting fps to %f\n",fps);
+		AVI_set_video(videoIn_right->avifile, videoIn_right->width, videoIn_right->height,
+				fps, "MJPG");
+		AVI_close(videoIn_right->avifile);
+	}
+
+	close_v4l2(videoIn_right);
+	free(videoIn_right);
+	destroyButt();
+	freeLut();
+	printf("Cleanup done. Exiting ...\n");
+	SDL_Quit();
+}
+
+int main(int argc, char *argv[])
+{
+	int i = 0;
+	int child;
+	int pid[2]={0};
+	//pthread_t sdl_left_thread_id, sdl_right_thread_id;
 
 	printf("luvcview %s\n\n", version);
-	for (i = 1; i < argc; i++) {
+
+	for (i = 1; i < argc; i++)
+	{
 		/* skip bad arguments */
 		if (argv[i] == NULL || *argv[i] == 0 || *argv[i] != '-') {
 			continue;
 		}
-		if (strcmp(argv[i], "-d") == 0) {
-			if (i + 1 >= argc) {
-				printf("No parameter specified with -d, aborting.\n");
-				exit(1);
-			}
-			videodevice = strdup(argv[i + 1]);
-		}
+
 		if (strcmp(argv[i], "-g") == 0) {
 			/* Ask for read instead default  mmap */
 			grabmethod = 0;
@@ -317,14 +737,7 @@ int main(int argc, char *argv[])
 			/* Enable raw frame stream capture from the start*/
 			enableRawFrameCapture = 2;
 		}
-		if (strcmp(argv[i], "-o") == 0) {
-			/* set the avi filename */
-			if (i + 1 >= argc) {
-				printf("No parameter specified with -o, aborting.\n");
-				exit(1);
-			}
-			avifilename = strdup(argv[i + 1]);
-		}
+
 		if (strcmp(argv[i], "-L") == 0) {
 			/* query list of valid video formats */
 			queryformats = 1;
@@ -340,220 +753,45 @@ int main(int argc, char *argv[])
 		}
 		if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			printf("usage: uvcview [-h -d -g -f -s -i -c -o -C -S -L -l -r]\n");
-			printf("-h   print this message\n");
-			printf("-d   /dev/videoX       use videoX device\n");
-			printf("-g   use read method for grab instead mmap\n");
-			printf("-w   disable SDL hardware accel.\n");
-			printf("-f   choose video format (YUYV/yuv and MJPG/jpg are valid, MJPG is default)\n");
-			printf("-i   fps           use specified frame rate\n");
-			printf("-s   widthxheight      use specified input size\n");
-			printf("-c   enable raw frame capturing for the first frame\n");
-			printf("-C   enable raw frame stream capturing from the start\n");
-			printf("-S   enable raw stream capturing from the start\n");
-			printf("-o   avifile  create avifile, default video.avi\n");
-			printf("-L   query valid video formats\n");
-			printf("-l   query valid controls and settings\n");
-			printf("-r   read and set control settings from luvcview.cfg (save/restore with F1/F2)\n");
+			printf("-h	 print this message\n");
+			printf("-d	 /dev/videoX	   use videoX device\n");
+			printf("-g	 use read method for grab instead mmap\n");
+			printf("-w	 disable SDL hardware accel.\n");
+			printf("-f	 choose video format (YUYV/yuv and MJPG/jpg are valid, MJPG is default)\n");
+			printf("-i	 fps		   use specified frame rate\n");
+			printf("-s	 widthxheight	   use specified input size\n");
+			printf("-c	 enable raw frame capturing for the first frame\n");
+			printf("-C	 enable raw frame stream capturing from the start\n");
+			printf("-S	 enable raw stream capturing from the start\n");
+			printf("-o	 avifile  create avifile, default video.avi\n");
+			printf("-L	 query valid video formats\n");
+			printf("-l	 query valid controls and settings\n");
+			printf("-r	 read and set control settings from luvcview.cfg (save/restore with F1/F2)\n");
 			exit(0);
 		}
 	}
 
-	/************* Test SDL capabilities ************/
-	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-		fprintf(stderr, "Couldn't initialize SDL: %s\n", SDL_GetError());
-		exit(1);
-	}
+	/*pthread_create(&sdl_left_thread_id, NULL, (void *)*sdl_left, NULL);
+	pthread_join(sdl_left_thread_id,NULL);
+	pthread_create(&sdl_right_thread_id, NULL, (void *)*sdl_right, NULL);
+	pthread_join(sdl_right_thread_id,NULL);*/
 
-	/* For this version, we'll be save and disable hardware acceleration */
-	if(hwaccel)
-		if ( ! getenv("SDL_VIDEO_YUV_HWACCEL") ) {
-			putenv("SDL_VIDEO_YUV_HWACCEL=0");
-		}
-
-	printf("SDL information:\n");
-	if (SDL_VideoDriverName(driver, sizeof(driver))) {
-		printf("  Video driver: %s\n", driver);
-	}
-	info = SDL_GetVideoInfo();
-
-	if (info->wm_available) {
-		printf("  A window manager is available\n");
-	}
-	if (info->hw_available) {
-		printf("  Hardware surfaces are available (%dk video memory)\n",
-				info->video_mem);
-		SDL_VIDEO_Flags |= SDL_HWSURFACE;
-	}
-	if (info->blit_hw) {
-		printf("  Copy blits between hardware surfaces are accelerated\n");
-		SDL_VIDEO_Flags |= SDL_ASYNCBLIT;
-	}
-	if (info->blit_hw_CC) {
-		printf
-			("  Colorkey blits between hardware surfaces are accelerated\n");
-	}
-	if (info->blit_hw_A) {
-		printf("  Alpha blits between hardware surfaces are accelerated\n");
-	}
-	if (info->blit_sw) {
-		printf
-			("  Copy blits from software surfaces to hardware surfaces are accelerated\n");
-	}
-	if (info->blit_sw_CC) {
-		printf
-			("  Colorkey blits from software surfaces to hardware surfaces are accelerated\n");
-	}
-	if (info->blit_sw_A) {
-		printf
-			("  Alpha blits from software surfaces to hardware surfaces are accelerated\n");
-	}
-	if (info->blit_fill) {
-		printf("  Color fills on hardware surfaces are accelerated\n");
-	}
-
-	if (!(SDL_VIDEO_Flags & SDL_HWSURFACE))
-		SDL_VIDEO_Flags |= SDL_SWSURFACE;
-
-	if (videodevice == NULL || *videodevice == 0) {
-		videodevice = "/dev/video0";
-	}
-
-	if (avifilename == NULL || *avifilename == 0) {
-		avifilename = "video.avi";
-	}
-
-	videoIn = (struct vdIn *) calloc(1, sizeof(struct vdIn));
-	if ( queryformats ) {
-		/* if we're supposed to list the video formats, do that now and go out */
-		check_videoIn(videoIn,(char *) videodevice);
-		free(videoIn);
-		SDL_Quit();
-		exit(1);
-	}
-	if (init_videoIn
-			(videoIn, (char *) videodevice, width, height, fps, format,
-			 grabmethod, avifilename) < 0)
-		exit(1);
-	/* if we're supposed to list the controls, do that now */
-	if ( querycontrols )
-		enum_controls(videoIn->fd);
-
-	/* if we're supposed to read the control settings from a configfile, do that now */
-	if ( readconfigfile )
-		load_controls(videoIn->fd);
-
-	pscreen =
-		SDL_SetVideoMode(videoIn->width, videoIn->height + 32, 0,
-				SDL_VIDEO_Flags);
-
-	overlay =
-		SDL_CreateYUVOverlay(videoIn->width, videoIn->height + 32,
-				SDL_YUY2_OVERLAY, pscreen);
-	p = (unsigned char *) overlay->pixels[0];
-	drect.x = 0;
-	drect.y = 0;
-	drect.w = pscreen->w;
-	drect.h = pscreen->h;
-	if (enableRawStreamCapture) {
-		videoIn->captureFile = fopen("stream.raw", "wb");
-		if(videoIn->captureFile == NULL) {
-			perror("Unable to open file for raw stream capturing");
+	for (i=0; i<2; i++) {
+		if ((child = fork()) == -1){
+			exit(EXIT_FAILURE);
+		} else if (child == 0) {
+			pid[i] = child;
+			if (i==0)
+				sdl_left(NULL);
+			else if (i==1)
+				sdl_right(NULL);
 		} else {
-			printf("Starting raw stream capturing to stream.raw ...\n");
 		}
 	}
-	if (enableRawFrameCapture)
-		videoIn->rawFrameCapture = enableRawFrameCapture;
-	initLut();
-	SDL_WM_SetCaption(title_act[A_VIDEO].title, NULL);
-	lasttime = SDL_GetTicks();
-	creatButt(videoIn->width, 32);
-	SDL_LockYUVOverlay(overlay);
-	memcpy(p + (videoIn->width * (videoIn->height) * 2), YUYVbutt,
-			videoIn->width * 64);
-	SDL_UnlockYUVOverlay(overlay);
-	/* initialize thread data */
-	ptdata.ptscreen = &pscreen;
-	ptdata.ptvideoIn = videoIn;
-	ptdata.ptsdlevent = &sdlevent;
-	ptdata.drect = &drect;
-	affmutex = SDL_CreateMutex();
-	ptdata.affmutex = affmutex;
-	mythread = SDL_CreateThread(eventThread, (void *) &ptdata);
 
-	// Initialize frame rate calculator
-	int loop_counter = 0;
-	const int frmrate_update = videoIn->fps / 2;
-	lasttime = SDL_GetTicks();	// [ms]
-
-	/* main big loop */
-	while (videoIn->signalquit) {
-		// Measure the frame rate every (fps/2) frames
-		if(loop_counter ++ % frmrate_update == 0)
-		{
-			currtime = SDL_GetTicks();	// [ms]
-			if (currtime - lasttime > 0) {
-				frmrate = frmrate_update * (1000.0 / (currtime - lasttime));
-			}
-			lasttime = currtime;
-		}
-
-		if (uvcGrab(videoIn) < 0) {
-			printf("Error grabbing\n");
-			break;
-		}
-
-		/* if we're grabbing video, show the frame rate */
-		if (videoIn->toggleAvi)
-			printf("\rframe rate: %g     ", frmrate);
-
-		SDL_LockYUVOverlay(overlay);
-		memcpy(p, videoIn->framebuffer,
-				videoIn->width * (videoIn->height) * 2);
-		SDL_UnlockYUVOverlay(overlay);
-		SDL_DisplayYUVOverlay(overlay, &drect);
-
-		if (videoIn->getPict) { 
-			switch(videoIn->formatIn){
-				case V4L2_PIX_FMT_MJPEG:
-					get_picture(videoIn->tmpbuffer,videoIn->buf.bytesused);
-					break;
-				case V4L2_PIX_FMT_YUYV:
-					get_pictureYV2(videoIn->framebuffer,videoIn->width,videoIn->height);
-					break;
-				default:
-					break;
-			}
-			videoIn->getPict = 0;
-			printf("get picture !\n");
-		}
-
-		SDL_LockMutex(affmutex);
-		ptdata.frmrate = frmrate;
-		SDL_WM_SetCaption(videoIn->status, NULL);
-		SDL_UnlockMutex(affmutex);
-		//SDL_Delay(1);
-
+	for (i=0; i<2; i++) {
+		waitpid(pid[i], NULL, 0);
 	}
-	SDL_WaitThread(mythread, &status);
-	SDL_DestroyMutex(affmutex);
-
-	/* if avifile is defined, we made a video: compute the exact fps and
-	   set it in the video */
-	if (videoIn->avifile != NULL) {
-		float fps=(videoIn->framecount/(videoIn->recordtime/1000));
-		fprintf(stderr,"setting fps to %f\n",fps);
-		AVI_set_video(videoIn->avifile, videoIn->width, videoIn->height,
-				fps, "MJPG");
-		AVI_close(videoIn->avifile);
-	}
-
-	close_v4l2(videoIn);
-	free(videoIn);
-	destroyButt();
-	freeLut();
-	printf("Cleanup done. Exiting ...\n");
-	SDL_Quit();
 }
 
 action_gui
@@ -585,7 +823,7 @@ action_gui GUI_keytoaction(SDLKey key)
 	return (A_VIDEO);
 }
 
-static int eventThread(void *data)
+static int eventThread_left(void *data)
 {
 	struct pt_data *gdata = (struct pt_data *) data;
 	struct v4l2_control control;
@@ -622,7 +860,326 @@ static int eventThread(void *data)
 					pscreen =
 						SDL_SetVideoMode(sdlevent->resize.w,
 								sdlevent->resize.h, 0,
-								SDL_VIDEO_Flags);
+								SDL_VIDEO_LEFT_Flags);
+					drect->w = sdlevent->resize.w;
+					drect->h = sdlevent->resize.h;
+					break;
+				case SDL_KEYDOWN:
+					curr_action = GUI_keytoaction(sdlevent->key.keysym.sym);
+					if (curr_action != A_VIDEO)
+						mouseon = 1;
+					break;
+				case SDL_QUIT:
+					printf("\nQuit signal received.\n");
+					videoIn->signalquit = 0;
+					break;
+			}
+		}			//end if poll
+		SDL_UnlockMutex(affmutex);
+		/* traiter les actions */
+		value = 0;
+		if (mouseon){
+			boucle++;
+			switch (curr_action) {
+				case A_BRIGHTNESS_UP:  
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_BRIGHTNESS)) < 0)
+						printf("Set Brightness up error\n");
+					break;
+				case A_CONTRAST_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_CONTRAST)) < 0)
+						printf("Set Contrast up error\n");
+					break;
+				case A_SATURATION_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_SATURATION)) < 0)
+						printf("Set Saturation up error\n");
+					break;
+				case A_GAIN_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_GAIN)) < 0)
+						printf("Set Gain up error\n");
+					break;
+				case A_SHARPNESS_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_SHARPNESS)) < 0)
+						printf("Set Sharpness up error\n");
+					break;
+				case A_GAMMA_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_GAMMA)) < 0)
+						printf("Set Gamma up error\n");
+					break;
+
+				/* Motor control events */
+				case A_PAN_UP:
+					if ((value = v4L2UpDownPan(videoIn, -incpantilt)) < 0)
+						printf("Set Pan up error\n");
+					break;
+				case A_PAN_DOWN: 
+					if ((value = v4L2UpDownPan(videoIn, incpantilt)) < 0)	    
+						printf("Set Pan down error\n");
+					break;
+				case A_TILT_UP:
+					if ((value = v4L2UpDownTilt(videoIn, -incpantilt)) < 0)
+						printf("Set Tilt up error\n");
+					break;
+				case A_TILT_DOWN: 
+					if ((value = v4L2UpDownTilt(videoIn, incpantilt)) < 0)	    
+						printf("Set Tilt down error\n");
+					break;
+				case A_PAN_RESET:
+					if (v4l2ResetPan(videoIn) < 0)
+						printf("Reset pan error\n");
+					break;
+				case A_TILT_RESET:
+					if (v4l2ResetTilt(videoIn) < 0)
+						printf("Reset tilt error\n");
+					break;
+
+				case A_SCREENSHOT:
+					SDL_Delay(200);
+					videoIn->getPict = 1;
+					value = 1;
+					break;
+				case A_RESET:
+					if (v4l2ResetControl(videoIn, V4L2_CID_BRIGHTNESS) < 0)
+						printf("reset Brightness error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_SATURATION) < 0)
+						printf("reset Saturation error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_CONTRAST) < 0)
+						printf("reset Contrast error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_HUE) < 0)
+						printf("reset Hue error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_SHARPNESS) < 0)
+						printf("reset Sharpness error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_GAMMA) < 0)
+						printf("reset Gamma error\n");
+					if (v4l2ResetControl(videoIn, V4L2_CID_GAIN) < 0)
+						printf("reset Gain error\n");
+					if (v4l2ResetPanTilt(videoIn) < 0)
+						printf("reset pantilt error\n");
+					break;
+
+				case A_BRIGHTNESS_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_BRIGHTNESS)) < 0)
+						printf("Set Brightness down error\n");
+					break;
+				case A_CONTRAST_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_CONTRAST)) < 0)
+						printf("Set Contrast down error\n");
+					break;
+				case A_SATURATION_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_SATURATION)) < 0)
+						printf("Set Saturation down error\n");
+					break;
+				case A_GAIN_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_GAIN)) < 0)
+						printf("Set Gain down error\n");
+					break;
+				case A_SHARPNESS_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_SHARPNESS)) < 0)
+						printf("Set Sharpness down error\n");
+					break;
+				case A_GAMMA_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_GAMMA)) < 0)
+						printf("Set Gamma down error\n");
+					break;   
+				case A_RECORD_TOGGLE:
+					SDL_Delay(200);
+					videoIn->toggleAvi = !videoIn->toggleAvi;
+					value = videoIn->toggleAvi;
+					if ( value == 1 ) {
+						printf("avi recording started\n");
+						videoIn->recordstart=SDL_GetTicks();
+					}
+					else {
+						int dur=SDL_GetTicks()-videoIn->recordstart;
+						printf("\navi recording stopped (%ds)\n",dur/1000);
+						videoIn->recordtime+=dur;
+					}
+					break;
+				case A_SWITCH_LIGHTFREQFILT: 
+					if ((value =v4l2GetControl(videoIn,V4L2_CID_POWER_LINE_FREQUENCY)) < 0)	    
+						printf("Get value of light frequency filter error\n");
+
+					if(value < 2) // round switch 50->60->NoFliker->.
+						value++;   //		 \_______________; 
+					else
+						value=0;
+
+					if(value == 0)
+						printf("Current light frequency filter: 50Hz\n");
+					else if(value == 1)
+						printf("Current light frequency filter: 60Hz\n");
+					else if(value == 2)
+						printf("Current light frequency filter: NoFliker\n");
+
+					if ((value =v4l2SetLightFrequencyFilter(videoIn,value)) < 0)	    
+						printf("Switch light frequency filter error\n");
+					break;
+				case A_QUIT:  
+					videoIn->signalquit = 0;
+					break;
+				case A_VIDEO:
+					break;
+				case A_CAPTURE_FRAME:
+					value = 1;
+					videoIn->rawFrameCapture = 1;
+					break;
+				case A_CAPTURE_FRAMESTREAM:
+					value = 1;
+					if (!videoIn->rawFrameCapture) {
+						videoIn->rawFrameCapture = 2;
+						videoIn->rfsBytesWritten = 0;
+						videoIn->rfsFramesWritten = 0;
+						printf("Starting raw frame stream capturing ...\n");
+					} else if(videoIn->framesWritten >= 5) {
+						videoIn->rawFrameCapture = 0;
+						printf("Stopped raw frame stream capturing. %u bytes written for %u frames.\n",
+								videoIn->rfsBytesWritten, videoIn->rfsFramesWritten);
+					}
+					break;
+				case A_CAPTURE_STREAM:
+					value = 1;
+					if (videoIn->captureFile == NULL) {
+						videoIn->captureFile = fopen("stream.raw", "wb");
+						if(videoIn->captureFile == NULL) {
+							perror("Unable to open file for raw stream capturing");
+						} else {
+							printf("Starting raw stream capturing to stream.raw ...\n");
+						}
+						videoIn->bytesWritten = 0;
+						videoIn->framesWritten = 0;
+					} else if(videoIn->framesWritten >= 5) {
+						fclose(videoIn->captureFile);
+						printf("Stopped raw stream capturing to stream.raw. %u bytes written for %u frames.\n",
+								videoIn->bytesWritten, videoIn->framesWritten);
+						videoIn->captureFile = NULL;
+					}
+					break;
+				case A_EXPOSURE_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_EXPOSURE_ABSOLUTE)) < 0)
+						printf("Set Absolute Exposure up error\n");
+					break;
+				case A_EXPOSURE_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_EXPOSURE_ABSOLUTE)) < 0)
+						printf("Set Absolute Exposure down error\n");
+					break;
+				case A_EXPOSURE_ON:
+					control.id    =V4L2_CID_EXPOSURE_AUTO;
+					control.value =1;
+					if ((value = ioctl(videoIn->fd, VIDIOC_S_CTRL, &control)) < 0)
+						printf("Set Auto Exposure on error\n");
+					else
+						printf("Auto Exposure set to %d\n", control.value);
+					break;
+				case A_EXPOSURE_OFF:
+					control.id    =V4L2_CID_EXPOSURE_AUTO;
+					control.value =8;
+					if ((value = ioctl(videoIn->fd, VIDIOC_S_CTRL, &control)) < 0)
+						printf("Set Auto Exposure off error\n");
+					else
+						printf("Auto Exposure set to %d\n", control.value);
+					break;
+				case A_BALANCE_UP:
+					if ((value = v4l2UpControl(videoIn, V4L2_CID_WHITE_BALANCE_TEMPERATURE)) < 0)
+						printf("Set Balance Temperature up error\n");
+					break;
+				case A_BALANCE_DOWN:
+					if ((value = v4l2DownControl(videoIn, V4L2_CID_WHITE_BALANCE_TEMPERATURE)) < 0)
+						printf("Set Balance Temperature down error\n");
+					break;
+				case A_BALANCE_ON:
+					control.id    =V4L2_CID_AUTO_WHITE_BALANCE;
+					control.value =1;
+					if ((value = ioctl(videoIn->fd, VIDIOC_S_CTRL, &control)) < 0)
+						printf("Set Auto Balance on error\n");
+					else
+						printf("Auto Balance set to %d\n", control.value);
+					break;
+				case A_BALANCE_OFF:
+					control.id    =V4L2_CID_AUTO_WHITE_BALANCE;
+					control.value =0;
+					if ((value = ioctl(videoIn->fd, VIDIOC_S_CTRL, &control)) < 0)
+						printf("Set Auto Balance off error\n");
+					else
+						printf("Auto Balance set to %d\n", control.value);
+					break;
+				case A_SAVE:
+					printf("Save controls\n");
+					save_controls(videoIn->fd);
+					break;
+				case A_LOAD:
+					printf("load controls\n");
+					load_controls(videoIn->fd);
+					break;
+				default:
+					break;
+			}
+			if(!(boucle%10)) // smooth pan tilt method
+				if(incpantilt < (10*INCPANTILT))
+					incpantilt += (INCPANTILT/4);
+			if(value){
+				len = strlen(title_act[curr_action].title)+8;
+				snprintf(videoIn->status, len,"%s %06d",title_act[curr_action].title,value);
+			}
+		} else { // mouseon
+
+			len = 100 * sizeof(char);	// as allocated in init_videoIn
+			snprintf(videoIn->status, len, "%s, %.1f fps", title_act[curr_action].title, frmrate);
+
+		}
+		SDL_Delay(50);
+		//printf("fp/s %d\n",frmrate);
+	}				//end main loop
+
+	/* Close the stream capture file */
+	if (videoIn->captureFile) {
+		fclose(videoIn->captureFile);
+		printf("Stopped raw stream capturing to stream.raw. %u bytes written for %u frames.\n",
+				videoIn->bytesWritten, videoIn->framesWritten);
+	}
+	/* Display stats for raw frame stream capturing */
+	if (videoIn->rawFrameCapture == 2) {
+		printf("Stopped raw frame stream capturing. %u bytes written for %u frames.\n",
+				videoIn->rfsBytesWritten, videoIn->rfsFramesWritten);
+	}
+}
+
+static int eventThread_right(void *data)
+{
+	struct pt_data *gdata = (struct pt_data *) data;
+	struct v4l2_control control;
+	SDL_Surface *pscreen = *gdata->ptscreen;
+	struct vdIn *videoIn = gdata->ptvideoIn;
+	SDL_Event *sdlevent = gdata->ptsdlevent;
+	SDL_Rect *drect = gdata->drect;
+	SDL_mutex *affmutex = gdata->affmutex;
+	int x, y;
+	int mouseon = 0;
+	int value = 0;
+	int len = 0;
+	short incpantilt = INCPANTILT;
+	int boucle = 0;
+	action_gui curr_action = A_VIDEO;
+	while (videoIn->signalquit) {
+		SDL_LockMutex(affmutex);
+		float frmrate = gdata->frmrate;
+		while (SDL_PollEvent(sdlevent)) {	//scan the event queue
+			switch (sdlevent->type) {
+				case SDL_KEYUP:
+				case SDL_MOUSEBUTTONUP:
+					mouseon = 0;
+					incpantilt = INCPANTILT;
+					boucle = 0;
+					break;
+				case SDL_MOUSEBUTTONDOWN:
+					mouseon = 1;
+				case SDL_MOUSEMOTION:
+					SDL_GetMouseState(&x, &y);
+					curr_action = GUI_whichbutton(x, y, pscreen, videoIn);
+					break;
+				case SDL_VIDEORESIZE:
+					pscreen =
+						SDL_SetVideoMode(sdlevent->resize.w,
+								sdlevent->resize.h, 0,
+								SDL_VIDEO_RIGHT_Flags);
 					drect->w = sdlevent->resize.w;
 					drect->h = sdlevent->resize.h;
 					break;

@@ -33,7 +33,7 @@
 #include <SDL/SDL_thread.h>
 #include <SDL/SDL_audio.h>
 #include <SDL/SDL_timer.h>
-#include <linux/videodev.h>
+#include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -223,8 +223,8 @@ int main(int argc, char *argv[])
 	int i;
 	int grabmethod = 1;
 	int width = 640;
-	int height = 480;
-	float fps = 30.0;			// Requested frame rate
+	int height = 360;
+	float fps = 60.0;			// Requested frame rate
 	float frmrate = 0.0;		// Measured frame rate
 	char *avifilename = NULL;
 	int queryformats = 0;
@@ -532,7 +532,7 @@ int main(int argc, char *argv[])
 		ptdata.frmrate = frmrate;
 		SDL_WM_SetCaption(videoIn->status, NULL);
 		SDL_UnlockMutex(affmutex);
-		SDL_Delay(10);
+		//SDL_Delay(1);
 
 	}
 	SDL_WaitThread(mythread, &status);

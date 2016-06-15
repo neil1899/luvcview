@@ -39,7 +39,12 @@
 #define NB_BUFFER 4
 #define DHT_SIZE 432
 
-
+typedef enum buffer_state {
+    BUFFER_FREE,
+    CAPTURE_USING,
+    CAPTURE_USED,
+    MAX,
+} buffer_state;
 
 struct vdIn {
     int fd;
@@ -51,8 +56,11 @@ struct vdIn {
     struct v4l2_buffer buf;
     struct v4l2_requestbuffers rb;
     void *mem[NB_BUFFER];
-    unsigned char *tmpbuffer;
-    unsigned char *framebuffer;
+    unsigned char *tmpbuffer[NB_BUFFER];
+    unsigned char *framebuffer[NB_BUFFER];
+	int framebuffer_state[NB_BUFFER];
+	int buf_used[NB_BUFFER];
+	int latest_buffer_number;
     int isstreaming;
     int grabmethod;
     int width;
@@ -80,6 +88,7 @@ struct vdIn {
     int recordstart;
     int recordtime;
 };
+
 int
 init_videoIn(struct vdIn *vd, char *device, int width, int height, float fps,
 	     int format, int grabmethod, char *avifilename);
@@ -87,7 +96,8 @@ int enum_controls(int vd);
 int save_controls(int vd);
 int load_controls(int vd);
 	     
-int uvcGrab(struct vdIn *vd);
+int uvcGrab_left(struct vdIn *vd, int buffer_number);
+int uvcGrab_right(struct vdIn *vd, int buffer_number);
 int close_v4l2(struct vdIn *vd);
 
 int v4l2GetControl(struct vdIn *vd, int control);

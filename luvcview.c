@@ -184,6 +184,32 @@ static const char version[] = VERSION;
 struct vdIn *videoIn_left;
 struct vdIn *videoIn_right;
 
+static uint64_t left_time_start = -1;
+static uint64_t left_time_end = -1;
+static uint64_t right_time_start = -1;
+static uint64_t right_time_end = -1;
+static uint64_t trackre_time_start = -1;
+static uint64_t trackre_time_end = -1;
+
+static int total_frames_left = 0;
+static int total_frames_right = 0;
+static int total_frames_trackre = 0;
+
+extern uint64_t jpeg_time_total;
+
+static uint64_t vcos_getmicrosecs64_internal(void)
+{
+   struct timeval tv;
+   uint64_t tm = 0;
+
+   if (!gettimeofday(&tv, NULL))
+   {
+      tm = (tv.tv_sec * 1000000LL) + tv.tv_usec;
+   }
+
+   return tm;
+}
+
 /* Translates screen coordinates into buttons */
 action_gui
 GUI_whichbutton(int x, int y, SDL_Surface * pscreen, struct vdIn *videoIn);
@@ -199,12 +225,51 @@ struct pt_data {
 	struct vdIn *ptvideoIn_right;
     float frmrate;
     SDL_mutex *affmutex;
-} pt_data;
+} pt_common_data;
+
+struct pt_camera_data {
+    SDL_Overlay **ptoverlay;
+    SDL_Rect *drect;
+    struct vdIn *ptvideoIn;
+    float frmrate;
+    SDL_mutex *affmutex;
+	SDL_mutex *trackretex;
+} pt_camera_left_data, pt_camera_right_data;
+
+struct pt_trackre_data {
+    struct vdIn *ptvideoIn_left;
+	struct vdIn *ptvideoIn_right;
+	SDL_mutex *trackretex_left;
+	SDL_mutex *trackretex_right;
+} pt_common_trackre_data;
 
 static int eventThread(void *data);
+static int eventthread_camera_left(void *data);
+static int eventthread_camera_right(void *data);
+static int eventthread_trackre(void *data);
 
 static Uint32 SDL_VIDEO_Flags =
     SDL_ANYFORMAT | SDL_DOUBLEBUF | SDL_RESIZABLE;
+
+static void signal_handler(int signal_number)
+{
+   if (left_time_end == -1) {
+      left_time_end = vcos_getmicrosecs64_internal()/1000;
+   }
+
+   if (right_time_end == -1) {
+      right_time_end = vcos_getmicrosecs64_internal()/1000;
+   }
+
+   if (trackre_time_end == -1) {
+      trackre_time_end = vcos_getmicrosecs64_internal()/1000;
+   }
+   printf("left total frames %d, spend time is %lldms\n", total_frames_left, (left_time_end - left_time_start));
+   printf("right total frames %d, spend time is %lldms\n", total_frames_right, (right_time_end - right_time_start));
+   printf("trackre total frames %d, spend time is %lldms\n", total_frames_trackre, (trackre_time_end - trackre_time_start));
+
+   printf("left total frames %d, jpeg spend time is %lldms\n", total_frames_left, jpeg_time_total);
+}
 
 int main(int argc, char *argv[])
 {
@@ -218,8 +283,9 @@ int main(int argc, char *argv[])
 	SDL_Rect drect_right;
 
 	SDL_Event sdlevent;
-	SDL_Thread *mythread;
+	SDL_Thread *mythread, *camera_left_thread, *camera_right_thread, *camera_trakre;
 	SDL_mutex *affmutex;
+	SDL_mutex *trackre_left, *trackre_right;
 
 	int i;
 	int status;
@@ -252,6 +318,8 @@ int main(int argc, char *argv[])
 	char *avifilename_right = NULL;
 
 	printf("luvcview %s\n\n", version);
+
+	signal(SIGINT, signal_handler);
 
 	for (i = 1; i < argc; i++)
 	{
@@ -513,7 +581,8 @@ int main(int argc, char *argv[])
 		videoIn_right->rawFrameCapture = enableRawFrameCapture;
 	}
 
-	initLut();
+	initLut_Left();
+	initLut_Right();
 	SDL_WM_SetCaption(title_act[A_VIDEO].title, NULL);
 
 	lasttime = SDL_GetTicks();
@@ -530,102 +599,46 @@ int main(int argc, char *argv[])
 	SDL_UnlockYUVOverlay(overlay_right);
 
 	/* initialize thread data */
-	pt_data.ptscreen = &pscreen;
-	pt_data.ptvideoIn_left = videoIn_left;
-	pt_data.ptvideoIn_right = videoIn_right;
-	pt_data.ptsdlevent = &sdlevent;
-	pt_data.drect_left = &drect_left;
-	pt_data.drect_right = &drect_right;
+	pt_common_data.ptscreen = &pscreen;
+	pt_common_data.ptvideoIn_left = videoIn_left;
+	pt_common_data.ptvideoIn_right = videoIn_right;
+	pt_common_data.ptsdlevent = &sdlevent;
+	pt_common_data.drect_left = &drect_left;
+	pt_common_data.drect_right = &drect_right;
 	affmutex = SDL_CreateMutex();
-	pt_data.affmutex = affmutex;
-	mythread = SDL_CreateThread(eventThread, (void *) &pt_data);
+	pt_common_data.affmutex = affmutex;
 
-	// Initialize frame rate calculator
-	int loop_counter = 0;
-	const int frmrate_update = videoIn_left->fps / 2;
-	lasttime = SDL_GetTicks();	// [ms]
+	trackre_left = SDL_CreateMutex();
+	trackre_right = SDL_CreateMutex();
 
-	/* main big loop */
-	while (videoIn_left->signalquit) {
-		// Measure the frame rate every (fps/2) frames
-		if(loop_counter ++ % frmrate_update == 0)
-		{
-			currtime = SDL_GetTicks();	// [ms]
-			if (currtime - lasttime > 0) {
-				frmrate = frmrate_update * (1000.0 / (currtime - lasttime));
-			}
-			lasttime = currtime;
-		}
+	pt_camera_left_data.ptoverlay = &overlay_left;
+	pt_camera_left_data.ptvideoIn = videoIn_left;
+	pt_camera_left_data.drect = &drect_left;
+	pt_camera_left_data.affmutex = affmutex;
+	pt_camera_left_data.trackretex = trackre_left;
 
-		if (uvcGrab(videoIn_left) < 0) {
-			printf("Error grabbing\n");
-			break;
-		}
+	pt_camera_right_data.ptoverlay = &overlay_right;
+	pt_camera_right_data.ptvideoIn = videoIn_right;
+	pt_camera_right_data.drect = &drect_right;
+	pt_camera_right_data.affmutex = affmutex;
+	pt_camera_right_data.trackretex = trackre_right;
 
-		if (uvcGrab(videoIn_right) < 0) {
-			printf("Error grabbing\n");
-			break;
-		}
+	pt_common_trackre_data.ptvideoIn_left = videoIn_left;
+	pt_common_trackre_data.ptvideoIn_right = videoIn_right;
+	pt_common_trackre_data.trackretex_left = trackre_left;
+	pt_common_trackre_data.trackretex_right = trackre_right;
 
-		/* if we're grabbing video, show the frame rate */
-#if 0
-		if (videoIn_left->toggleAvi)
-			printf("\rframe rate: %g     ", frmrate);
-		if (videoIn_right->toggleAvi)
-			printf("\rframe rate: %g     ", frmrate);
-#endif
+	mythread = SDL_CreateThread(eventThread, (void *) &pt_common_data);
+	camera_left_thread = SDL_CreateThread(eventthread_camera_left, (void *) &pt_camera_left_data);
+	camera_right_thread = SDL_CreateThread(eventthread_camera_right, (void *) &pt_camera_right_data);
+	camera_trakre = SDL_CreateThread(eventthread_trackre, (void *) &pt_common_trackre_data);
 
-		SDL_LockYUVOverlay(overlay_left);
-		memcpy(p_left, videoIn_left->framebuffer,
-				videoIn_left->width * (videoIn_left->height) * 2);
-		SDL_UnlockYUVOverlay(overlay_left);
-		SDL_DisplayYUVOverlay(overlay_left, &drect_left);
-
-		SDL_LockYUVOverlay(overlay_right);
-		memcpy(p_right, videoIn_right->framebuffer,
-				videoIn_right->width * (videoIn_right->height) * 2);
-		SDL_UnlockYUVOverlay(overlay_right);
-		SDL_DisplayYUVOverlay(overlay_right, &drect_right);
-
-		if (videoIn_left->getPict) {
-			switch(videoIn_left->formatIn){
-				case V4L2_PIX_FMT_MJPEG:
-					get_picture(videoIn_left->tmpbuffer,videoIn_left->buf.bytesused);
-					break;
-				case V4L2_PIX_FMT_YUYV:
-					get_pictureYV2(videoIn_left->framebuffer,videoIn_left->width,videoIn_left->height);
-					break;
-				default:
-					break;
-			}
-			videoIn_left->getPict = 0;
-			printf("get picture !\n");
-		}
-
-		if (videoIn_right->getPict) {
-			switch(videoIn_right->formatIn){
-				case V4L2_PIX_FMT_MJPEG:
-					get_picture(videoIn_right->tmpbuffer,videoIn_right->buf.bytesused);
-					break;
-				case V4L2_PIX_FMT_YUYV:
-					get_pictureYV2(videoIn_right->framebuffer,videoIn_right->width,videoIn_right->height);
-					break;
-				default:
-					break;
-			}
-			videoIn_right->getPict = 0;
-			printf("get picture !\n");
-		}
-
-		SDL_LockMutex(affmutex);
-		pt_data.frmrate = frmrate;
-		SDL_WM_SetCaption(videoIn_left->status, NULL);
-		SDL_UnlockMutex(affmutex);
-		//SDL_Delay(10);
-
-	}
 	SDL_WaitThread(mythread, &status);
+	SDL_WaitThread(camera_left_thread, &status);
+	SDL_WaitThread(camera_right_thread, &status);
 	SDL_DestroyMutex(affmutex);
+	SDL_DestroyMutex(trackre_left);
+	SDL_DestroyMutex(trackre_right);
 
 	/* if avifile is defined, we made a video: compute the exact fps and
 	   set it in the video */
@@ -650,7 +663,8 @@ int main(int argc, char *argv[])
 	close_v4l2(videoIn_right);
 	free(videoIn_right);
 	destroyButt();
-	freeLut();
+	freeLut_Left();
+	freeLut_Right();
 	printf("Cleanup done. Exiting ...\n");
 	SDL_Quit();
 }
@@ -1160,5 +1174,313 @@ static int eventThread(void *data)
 	if (videoIn_right->rawFrameCapture == 2) {
 		printf("Stopped raw frame stream capturing. %u bytes written for %u frames.\n",
 				videoIn_right->rfsBytesWritten, videoIn_right->rfsFramesWritten);
+	}
+}
+
+#if 0
+int decode_usb_jpeg_file(const char *srcdata, int srclen)
+{
+    struct jpeg_decompress_struct cinfo;
+    struct my_error_mgr jerr;
+    JSAMPARRAY buffer;      /* Output row buffer */
+    int row_stride;     	/* physical row width in output buffer */
+
+    int finished = 1;
+    int chromaWidth, chromaHeight;
+    int yMask,xMask;
+
+    int x,y;
+    int width,height;
+
+    unsigned char *pixels, *rgbPixels, *src;
+	unsigned char *yPixels, *uPixels, *vPixels;
+    unsigned char *yPtr, *uPtr, *vPtr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+		jpeg_destroy_decompress(&cinfo);
+		return -1;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, srcdata, srclen);
+    (void)jpeg_read_header(&cinfo, TRUE);
+
+    /*set parameters for decompression */
+    cinfo.out_color_space = JCS_YCbCr;
+
+    (void)jpeg_start_decompress(&cinfo);
+
+    width  = cinfo.output_width;
+    height = cinfo.output_height;
+
+    pixels = (unsigned char *)malloc(width*height*3);
+    memset(pixels, 0, width * height * 3);
+
+    src = rgbPixels = pixels;
+
+    /* JSAMPLEs per row in output buffer */
+    row_stride = cinfo.output_width * cinfo.output_components;
+    /* Make a one-row-high sample array that will go away when done with image */
+
+    buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+		int num_rows = jpeg_read_scanlines(&cinfo, buffer, 1);
+		if (num_rows == 0) {
+			finished = 0;
+			break;
+		}
+    }
+
+    if(finished){
+		(void) jpeg_finish_decompress(&cinfo);
+    }
+
+    jpeg_destroy_decompress(&cinfo);
+
+    return 0;
+}
+#endif
+
+static int eventthread_camera_left(void *data)
+{
+	int i = 0;
+	struct pt_camera_data *gdata = (struct pt_camera_data *)data;
+	SDL_Overlay *poverlay = *gdata->ptoverlay;
+	struct vdIn *videoIn = gdata->ptvideoIn;
+	SDL_Rect *drect = gdata->drect;
+	SDL_mutex *affmutex = gdata->affmutex;
+	SDL_mutex *trackretex = gdata->trackretex;
+	unsigned char *p = (unsigned char *)poverlay->pixels[0];
+
+	while (videoIn->signalquit) {
+		if (left_time_start == -1) {
+		   left_time_start = vcos_getmicrosecs64_internal()/1000;
+		}
+
+		SDL_LockMutex(trackretex);
+		for (i=0; i<NB_BUFFER; i++) {
+			if(videoIn->framebuffer_state[i] == BUFFER_FREE) {
+				videoIn->framebuffer_state[i] = CAPTURE_USING;
+				break;
+			}
+		}
+		SDL_UnlockMutex(trackretex);
+
+		if ( i != NB_BUFFER ) {
+			if (uvcGrab_left(videoIn, i) < 0) {
+				printf("Error grabbing\n");
+				break;
+			} else {
+				total_frames_left++;
+				SDL_LockMutex(trackretex);
+				videoIn->framebuffer_state[i] = CAPTURE_USED;
+				videoIn->latest_buffer_number = i;
+				SDL_UnlockMutex(trackretex);
+			}
+
+			SDL_LockMutex(affmutex);
+			SDL_LockYUVOverlay(poverlay);
+			memcpy(p, videoIn->framebuffer[i],
+					videoIn->width * (videoIn->height) * 2);
+			SDL_UnlockYUVOverlay(poverlay);
+			SDL_DisplayYUVOverlay(poverlay, drect);
+			SDL_UnlockMutex(affmutex);
+		}else {
+			//printf("left not be used error\n");
+		}
+#if 0
+		if (videoIn->getPict) {
+			switch(videoIn->formatIn){
+				case V4L2_PIX_FMT_MJPEG:
+					get_picture_left(videoIn->tmpbuffer[i], videoIn->buf.bytesused);
+					break;
+				case V4L2_PIX_FMT_YUYV:
+					get_pictureYV2_Left(videoIn->framebuffer[i], videoIn->width, videoIn->height);
+					break;
+				default:
+					break;
+			}
+			videoIn->getPict = 0;
+			printf("get picture !\n");
+		}
+#endif
+	}
+}
+
+static int eventthread_camera_right(void *data)
+{
+	int i = 0;
+	struct pt_camera_data *gdata = (struct pt_camera_data *)data;
+	SDL_Overlay *poverlay = *gdata->ptoverlay;
+	struct vdIn *videoIn = gdata->ptvideoIn;
+	SDL_Rect *drect = gdata->drect;
+	SDL_mutex *affmutex = gdata->affmutex;
+	SDL_mutex *trackretex = gdata->trackretex;
+	unsigned char *p = (unsigned char *)poverlay->pixels[0];
+
+	while (videoIn->signalquit) {
+		if (right_time_start == -1) {
+		   right_time_start = vcos_getmicrosecs64_internal()/1000;
+		}
+
+		SDL_LockMutex(trackretex);
+		for (i=0; i<NB_BUFFER; i++) {
+			if(videoIn->framebuffer_state[i]==BUFFER_FREE){
+				videoIn->framebuffer_state[i] = CAPTURE_USING;
+				break;
+			}
+		}
+		SDL_UnlockMutex(trackretex);
+
+		if ( i != NB_BUFFER ) {
+			if (uvcGrab_right(videoIn, i) < 0) {
+				printf("Error grabbing\n");
+				break;
+			} else {
+				total_frames_right++;
+				SDL_LockMutex(trackretex);
+				videoIn->framebuffer_state[i] = CAPTURE_USED;
+				videoIn->latest_buffer_number = i;
+				SDL_UnlockMutex(trackretex);
+			}
+
+			SDL_LockMutex(affmutex);
+			SDL_LockYUVOverlay(poverlay);
+			memcpy(p, videoIn->framebuffer[i],
+					videoIn->width * (videoIn->height) * 2);
+			SDL_UnlockYUVOverlay(poverlay);
+			SDL_DisplayYUVOverlay(poverlay, drect);
+			SDL_UnlockMutex(affmutex);
+		}else {
+			//printf("right not be used\n");
+		}
+#if 0
+		if (videoIn->getPict) {
+			switch(videoIn->formatIn){
+				case V4L2_PIX_FMT_MJPEG:
+					get_picture_right(videoIn->tmpbuffer[i],videoIn->buf.bytesused);
+					break;
+				case V4L2_PIX_FMT_YUYV:
+					get_pictureYV2_Right(videoIn->framebuffer[i],videoIn->width,videoIn->height);
+					break;
+				default:
+					break;
+			}
+			videoIn->getPict = 0;
+			printf("get picture !\n");
+		}
+#endif
+	}
+}
+
+void call_trackre(void)
+{
+	//TODO
+	;
+}
+
+static int eventthread_trackre(void *data)
+{
+	int i = 0;
+	static int number_picture = 0;
+	static int left_buffer_number = -1;
+	static int right_buffer_number = -1;
+	static int left_flag = 0;
+	static int right_flag = 0;
+	struct pt_trackre_data *gdata = (struct pt_trackre_data *)data;
+	struct vdIn *videoIn_left = gdata->ptvideoIn_left;
+	struct vdIn *videoIn_right = gdata->ptvideoIn_right;
+	SDL_mutex *trackretex_left = gdata->trackretex_left;
+	SDL_mutex *trackretex_right = gdata->trackretex_right;
+
+	if (trackre_time_start == -1) {
+	   trackre_time_start = vcos_getmicrosecs64_internal()/1000;
+	}
+
+	while (videoIn_left->signalquit && videoIn_right->signalquit) {
+		SDL_LockMutex(trackretex_left);
+		if (/*(videoIn_left->latest_buffer_number != last_left_buffer_number) && */
+				(videoIn_left->framebuffer_state[videoIn_left->latest_buffer_number] == CAPTURE_USED)) {
+			left_buffer_number = videoIn_left->latest_buffer_number;
+			left_flag = 1;
+		} else {
+			left_flag = 0;
+		}
+		SDL_UnlockMutex(trackretex_left);
+
+		SDL_LockMutex(trackretex_right);
+		if (/*(videoIn_right->latest_buffer_number != last_right_buffer_number) && */
+				(videoIn_right->framebuffer_state[videoIn_right->latest_buffer_number] == CAPTURE_USED)) {
+			right_buffer_number = videoIn_right->latest_buffer_number;
+			right_flag = 1;
+		} else {
+			right_flag = 0;
+		}
+		SDL_UnlockMutex(trackretex_right);
+
+		if (left_flag && right_flag) {
+			SDL_LockMutex(trackretex_left);
+			if (videoIn_left->getPict) {
+				switch(videoIn_left->formatIn){
+					case V4L2_PIX_FMT_MJPEG:
+						get_picture_left(videoIn_left->tmpbuffer[left_buffer_number], videoIn_left->buf_used[left_buffer_number], number_picture);
+						break;
+					case V4L2_PIX_FMT_YUYV:
+						get_pictureYV2_Left(videoIn_left->framebuffer[left_buffer_number], videoIn_left->width, videoIn_left->height);
+						break;
+					default:
+						break;
+				}
+				videoIn_left->getPict = 0;
+				printf("Left get picture !\n");
+			}
+			SDL_UnlockMutex(trackretex_left);
+
+			SDL_LockMutex(trackretex_right);
+			if (videoIn_right->getPict) {
+				switch(videoIn_right->formatIn){
+					case V4L2_PIX_FMT_MJPEG:
+						get_picture_right(videoIn_right->tmpbuffer[right_buffer_number], videoIn_right->buf_used[right_buffer_number], number_picture);
+						break;
+					case V4L2_PIX_FMT_YUYV:
+						get_pictureYV2_Right(videoIn_right->framebuffer[right_buffer_number], videoIn_right->width, videoIn_right->height);
+						break;
+					default:
+						break;
+				}
+				videoIn_right->getPict = 0;
+				printf("Right get picture !\n");
+			}
+			SDL_UnlockMutex(trackretex_right);
+			number_picture++;
+		}
+
+		if (left_flag && right_flag) {
+			call_trackre();
+			total_frames_trackre++;
+			SDL_LockMutex(trackretex_left);
+			for (i=0; i<NB_BUFFER; i++) {
+				if (videoIn_left->framebuffer_state[i] == CAPTURE_USED && 
+						videoIn_left->latest_buffer_number != i) {
+					videoIn_left->framebuffer_state[i] = BUFFER_FREE;
+				}
+			}
+			videoIn_left->framebuffer_state[left_buffer_number] = BUFFER_FREE;
+			SDL_UnlockMutex(trackretex_left);
+
+			SDL_LockMutex(trackretex_right);
+			for (i=0; i<NB_BUFFER; i++) {
+				if (videoIn_right->framebuffer_state[i] == CAPTURE_USED && 
+						videoIn_right->latest_buffer_number != i) {
+					videoIn_right->framebuffer_state[i] = BUFFER_FREE;
+				}
+			}
+			videoIn_right->framebuffer_state[right_buffer_number] = BUFFER_FREE;
+			SDL_UnlockMutex(trackretex_right);
+		}
 	}
 }

@@ -84,7 +84,7 @@ int creatButt(int width, int height)
 {
     int wOrg = 0;
     int hOrg = 0;
-    jpeg_decode(&YUYVbuttOrg, bouttons, &wOrg, &hOrg);
+    jpeg_decode_left(&YUYVbuttOrg, bouttons, &wOrg, &hOrg);
     if (wOrg != BUTTWIDTH || hOrg != BUTTHEIGHT) {
 	printf(" alloc jpeg Button fail !!\n");
 	goto err;

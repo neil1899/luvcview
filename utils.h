@@ -37,9 +37,16 @@
 #define ERR_BAD_TABLES 14
 #define ERR_DEPTH_MISMATCH 15
 
-int jpeg_decode(unsigned char **pic, unsigned char *buf, int *width,
+int jpeg_decode_left(unsigned char **pic, unsigned char *buf, int *width,
 		int *height);
+int jpeg_decode_right(unsigned char **pic, unsigned char *buf, int *width,
+		int *height);
+
 int 
-get_picture(unsigned char *buf,int size);
+get_picture_left(unsigned char *buf,int size, int number);
 int
-get_pictureYV2(unsigned char *buf,int width,int height);
+get_pictureYV2_Left(unsigned char *buf,int width,int height);
+int 
+get_picture_right(unsigned char *buf,int size, int number);
+int
+get_pictureYV2_Right(unsigned char *buf,int width,int height);

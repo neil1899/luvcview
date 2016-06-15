@@ -34,10 +34,27 @@
 	
 
 static int debug = 0;
-
-
+static int debug_left = 0;
+static int debug_right = 0;
 
 static int init_v4l2(struct vdIn *vd);
+
+uint64_t jpeg_time_start = 0;
+uint64_t jpeg_time_end = 0;
+uint64_t jpeg_time_total = 0;
+
+static uint64_t jpeg_getmicrosecs64_internal(void)
+{
+   struct timeval tv;
+   uint64_t tm = 0;
+
+   if (!gettimeofday(&tv, NULL))
+   {
+      tm = (tv.tv_sec * 1000000LL) + tv.tv_usec;
+   }
+
+   return tm;
+}
 
 static int float_to_fraction_recursive(double f, double p, int *num, int *den)
 {
@@ -103,7 +120,7 @@ int
 init_videoIn(struct vdIn *vd, char *device, int width, int height, float fps,
 	     int format, int grabmethod, char *avifilename)
 {
-   int ret = -1;
+    int ret = -1;
     int i;
     if (vd == NULL || device == NULL)
 	return -1;
@@ -148,26 +165,36 @@ init_videoIn(struct vdIn *vd, char *device, int width, int height, float fps,
     vd->framesizeIn = (vd->width * vd->height << 1);
     switch (vd->formatIn) {
     case V4L2_PIX_FMT_MJPEG:
-	vd->tmpbuffer =
-	    (unsigned char *) calloc(1, (size_t) vd->framesizeIn);
-	if (!vd->tmpbuffer)
-	    goto error;
-	vd->framebuffer =
-	    (unsigned char *) calloc(1,
-				     (size_t) vd->width * (vd->height +
-							   8) * 2);
+	for (i=0; i<NB_BUFFER; i++) {
+		vd->tmpbuffer[i] =
+			(unsigned char *) calloc(1, (size_t) vd->framesizeIn);
+		if (!vd->tmpbuffer[i])
+			goto error;
+		vd->framebuffer[i] =
+			(unsigned char *) calloc(1,
+						 (size_t) vd->width * (vd->height +
+								   8) * 2);
+
+		vd->framebuffer_state[i] = BUFFER_FREE;
+	}
 	break;
     case V4L2_PIX_FMT_YUYV:
-	vd->framebuffer =
-	    (unsigned char *) calloc(1, (size_t) vd->framesizeIn);
+	for (i=0; i<NB_BUFFER; i++) {
+		vd->framebuffer[i] =
+			(unsigned char *) calloc(1, (size_t) vd->framesizeIn);
+	}
 	break;
     default:
 	printf(" should never arrive exit fatal !!\n");
 	goto error;
 	break;
     }
-    if (!vd->framebuffer)
-	goto error;
+
+	for (i=0; i<NB_BUFFER; i++) {
+	    if (!vd->framebuffer[i])
+		goto error;
+	}
+	vd->latest_buffer_number = -1;
     return 0;
   error:
     free(vd->videodevice);
@@ -528,7 +555,21 @@ fatal:
 
 }
 
-static int video_enable(struct vdIn *vd)
+static int video_enable_left(struct vdIn *vd)
+{
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    int ret;
+
+    ret = ioctl(vd->fd, VIDIOC_STREAMON, &type);
+    if (ret < 0) {
+	perror("Unable to start capture");
+	return ret;
+    }
+    vd->isstreaming = 1;
+    return 0;
+}
+
+static int video_enable_right(struct vdIn *vd)
 {
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     int ret;
@@ -556,14 +597,13 @@ static int video_disable(struct vdIn *vd)
     return 0;
 }
 
-
-int uvcGrab(struct vdIn *vd)
+int uvcGrab_left(struct vdIn *vd, int buffer_number)
 {
 #define HEADERFRAME1 0xaf
     int ret;
 
     if (!vd->isstreaming)
-	if (video_enable(vd))
+	if (video_enable_left(vd))
 	    goto err;
     memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
     vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -585,7 +625,7 @@ int uvcGrab(struct vdIn *vd)
 			vd->rawFrameCapture = 0;
 
 		/* Create a file name and open the file */
-		sprintf(filename, "frame%03u.raw", vd->fileCounter++ % 1000);
+		sprintf(filename, "left_frame%03u.raw", vd->fileCounter++ % 1000);
 		frame = fopen(filename, "wb");
 		if(frame == NULL) {
 			perror("Unable to open file for raw frame capturing");
@@ -627,7 +667,7 @@ end_capture:
 		} else {
 			vd->framesWritten++;
 			vd->bytesWritten += vd->buf.bytesused;
-			if (debug)
+			if (debug_left)
 				printf("Appended raw frame to stream file (%u bytes)\n", vd->buf.bytesused);
 		}
 	}
@@ -639,7 +679,8 @@ end_capture:
 	        printf("Ignoring empty buffer ...\n");
 	    return 0;
         }
-	memcpy(vd->tmpbuffer, vd->mem[vd->buf.index],vd->buf.bytesused);
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+		memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index],vd->buf.bytesused);
 	 /* avi recording is toggled on */
     if (vd->toggleAvi) {
         /* if vd->avifile is NULL, then we need to initialize it */
@@ -658,22 +699,164 @@ end_capture:
             }
         } else {
         /* if we have a valid avifile, record the frame to it */
-            AVI_write_frame(vd->avifile, vd->tmpbuffer,
+            AVI_write_frame(vd->avifile, vd->tmpbuffer[buffer_number],
                 vd->buf.bytesused, vd->framecount);
             vd->framecount++;
         }
     }
-	if (jpeg_decode(&vd->framebuffer, vd->tmpbuffer, &vd->width,
+	jpeg_time_start = jpeg_getmicrosecs64_internal()/1000;
+	if (jpeg_decode_left(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
 	     &vd->height) < 0) {
 	    printf("jpeg decode errors\n");
 	    goto err;
 	}
-	if (debug)
+	jpeg_time_end = jpeg_getmicrosecs64_internal()/1000;
+	jpeg_time_total += (jpeg_time_end - jpeg_time_start);
+	if (debug_left)
 	    printf("bytes in used %d\n", vd->buf.bytesused);
 	break;
     case V4L2_PIX_FMT_YUYV:
 	if (vd->buf.bytesused > vd->framesizeIn)
-	    memcpy(vd->framebuffer, vd->mem[vd->buf.index],
+	    memcpy(vd->framebuffer[buffer_number], vd->mem[vd->buf.index],
+		   (size_t) vd->framesizeIn);
+	else
+	    memcpy(vd->framebuffer[buffer_number], vd->mem[vd->buf.index],
+		   (size_t) vd->buf.bytesused);
+	break;
+    default:
+	goto err;
+	break;
+    }
+    ret = ioctl(vd->fd, VIDIOC_QBUF, &vd->buf);
+    if (ret < 0) {
+	perror("Unable to requeue buffer");
+	goto err;
+    }
+
+    return 0;
+  err:
+    vd->signalquit = 0;
+    return -1;
+}
+
+int uvcGrab_right(struct vdIn *vd, int buffer_number)
+{
+#define HEADERFRAME1 0xaf
+    int ret;
+
+    if (!vd->isstreaming)
+	if (video_enable_right(vd))
+	    goto err;
+    memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
+    vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    vd->buf.memory = V4L2_MEMORY_MMAP;
+    ret = ioctl(vd->fd, VIDIOC_DQBUF, &vd->buf);
+    if (ret < 0) {
+	perror("Unable to dequeue buffer");
+	goto err;
+    }
+
+	/* Capture a single raw frame */
+	if (vd->rawFrameCapture && vd->buf.bytesused > 0) {
+		FILE *frame = NULL;
+		char filename[13];
+		int ret;
+
+		/* Disable frame capturing unless we're in frame stream mode */
+		if(vd->rawFrameCapture == 1)
+			vd->rawFrameCapture = 0;
+
+		/* Create a file name and open the file */
+		sprintf(filename, "right_frame%03u.raw", vd->fileCounter++ % 1000);
+		frame = fopen(filename, "wb");
+		if(frame == NULL) {
+			perror("Unable to open file for raw frame capturing");
+			goto end_capture;
+		}
+		
+		/* Write the raw data to the file */
+		ret = fwrite(vd->mem[vd->buf.index], vd->buf.bytesused, 1, frame);
+		if(ret < 1) {
+			perror("Unable to write to file");
+			goto end_capture;
+		}
+		printf("Saved raw frame to %s (%u bytes)\n", filename, vd->buf.bytesused);
+		if(vd->rawFrameCapture == 2) {
+			vd->rfsBytesWritten += vd->buf.bytesused;
+			vd->rfsFramesWritten++;
+		}
+
+
+		/* Clean up */
+end_capture:
+		if(frame)
+			fclose(frame);
+	}
+
+   
+
+	/* Capture raw stream data */
+	if (vd->captureFile && vd->buf.bytesused > 0) {
+		int ret;
+		ret = fwrite(vd->mem[vd->buf.index], vd->buf.bytesused, 1, vd->captureFile);
+		if (ret < 1) {
+			perror("Unable to write raw stream to file");
+			fprintf(stderr, "Stream capturing terminated.\n");
+			fclose(vd->captureFile);
+			vd->captureFile = NULL;
+			vd->framesWritten = 0;
+			vd->bytesWritten = 0;
+		} else {
+			vd->framesWritten++;
+			vd->bytesWritten += vd->buf.bytesused;
+			if (debug_right)
+				printf("Appended raw frame to stream file (%u bytes)\n", vd->buf.bytesused);
+		}
+	}
+
+    switch (vd->formatIn) {
+    case V4L2_PIX_FMT_MJPEG:
+        if(vd->buf.bytesused <= HEADERFRAME1) {	/* Prevent crash on empty image */
+/*	    if(debug)*/
+	        printf("Ignoring empty buffer ...\n");
+	    return 0;
+        }
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+		memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index],vd->buf.bytesused);
+	 /* avi recording is toggled on */
+    if (vd->toggleAvi) {
+        /* if vd->avifile is NULL, then we need to initialize it */
+        if (vd->avifile == NULL) {
+            vd->avifile = AVI_open_output_file(vd->avifilename);
+
+            /* if avifile is NULL, there was an error */
+            if (vd->avifile == NULL ) {
+                fprintf(stderr,"Error opening avifile %s\n",vd->avifilename);
+            }
+            else {
+                /* we default the fps to 15, we'll reset it on close */
+                AVI_set_video(vd->avifile, vd->width, vd->height,
+                    15, "MJPG");
+                printf("recording to %s\n",vd->avifilename);
+            }
+        } else {
+        /* if we have a valid avifile, record the frame to it */
+            AVI_write_frame(vd->avifile, vd->tmpbuffer[buffer_number],
+                vd->buf.bytesused, vd->framecount);
+            vd->framecount++;
+        }
+    }
+	if (jpeg_decode_right(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
+	     &vd->height) < 0) {
+	    printf("jpeg decode errors\n");
+	    goto err;
+	}
+	if (debug_right)
+	    printf("bytes in used %d\n", vd->buf.bytesused);
+	break;
+    case V4L2_PIX_FMT_YUYV:
+	if (vd->buf.bytesused > vd->framesizeIn)
+	    memcpy(vd->framebuffer[buffer_number], vd->mem[vd->buf.index],
 		   (size_t) vd->framesizeIn);
 	else
 	    memcpy(vd->framebuffer, vd->mem[vd->buf.index],
@@ -694,15 +877,20 @@ end_capture:
     vd->signalquit = 0;
     return -1;
 }
+
 int close_v4l2(struct vdIn *vd)
 {
+	int i = 0;
     if (vd->isstreaming)
 	video_disable(vd);
-    if (vd->tmpbuffer)
-	free(vd->tmpbuffer);
-    vd->tmpbuffer = NULL;
-    free(vd->framebuffer);
-    vd->framebuffer = NULL;
+
+	for (i=0; i<NB_BUFFER; i++) {
+		if (vd->tmpbuffer[i])
+		free(vd->tmpbuffer[i]);
+		vd->tmpbuffer[i] = NULL;
+		free(vd->framebuffer[i]);
+		vd->framebuffer[i] = NULL;
+	}
     free(vd->videodevice);
     free(vd->status);
     free(vd->pictName);

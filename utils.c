@@ -281,7 +281,7 @@ nextbyte:
 	    break;
 
 	case M_DRI:
-	printf("find DRI \n");
+	//printf("find DRI \n");
 	    l = getword_left();
 	    info_left.dri = getword_left();
 	    break;
@@ -361,7 +361,7 @@ nextbyte:
 	    break;
 
 	case M_DRI:
-	printf("find DRI \n");
+	//printf("find DRI \n");
 	    l = getword_right();
 	    info_right.dri = getword_right();
 	    break;
@@ -817,7 +817,7 @@ int jpeg_decode_right(unsigned char **pic, unsigned char *buf, int *width,
 	err = ERR_NOT_YCBCR_221111;
 	goto error;
     }
-*/    
+*/
     /* if internal width and external are not the same or heigth too 
        and pic not allocated realloc the good size and mark the change 
        need 1 macroblock line more ?? */

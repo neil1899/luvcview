@@ -10,6 +10,7 @@ INSTALL=install
 APP_BINARY=luvcview
 BIN=/usr/local/bin
 MATH_LIB = -lm
+JPEG_LIB = -ljpeg
 SDLLIBS = $(shell sdl-config --libs) 
 SDLFLAGS = $(shell sdl-config --cflags)
 #LIBX11FLAGS= -I/usr/X11R6/include -L/usr/X11R6/lib
@@ -40,6 +41,7 @@ luvcview:	$(OBJECTS)
 	$(CC)	$(CFLAGS) $(OBJECTS) $(X11_LIB) $(XPM_LIB)\
 		$(MATH_LIB) \
 		$(SDLLIBS)\
+		$(JPEG_LIB)\
 		-o $(APP_BINARY)
 	chmod 755 $(APP_BINARY)
 

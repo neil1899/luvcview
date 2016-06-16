@@ -35,9 +35,22 @@
 #include "uvcvideo.h"
 #include "dynctrl-logitech.h"
 
+//for libjpeg
+#include <setjmp.h>
+#include <jpeglib.h>
 
 #define NB_BUFFER 4
 #define DHT_SIZE 432
+
+#define PUT_2B(array,offset,value)  \
+        (array[offset]   = (char) ((value) & 0xFF), \
+         array[offset+1] = (char) (((value) >> 8) & 0xFF))
+
+#define PUT_4B(array,offset,value)  \
+        (array[offset]   = (char) ((value) & 0xFF), \
+         array[offset+1] = (char) (((value) >> 8) & 0xFF), \
+         array[offset+2] = (char) (((value) >> 16) & 0xFF), \
+         array[offset+3] = (char) (((value) >> 24) & 0xFF))
 
 typedef enum buffer_state {
     BUFFER_FREE,
@@ -45,6 +58,13 @@ typedef enum buffer_state {
     CAPTURE_USED,
     MAX,
 } buffer_state;
+
+struct error_mgr_t {
+	struct jpeg_error_mgr pub;    /* "public" fields */
+	jmp_buf setjmp_buffer;    /* for return to caller */
+};
+
+typedef struct error_mgr_t * error_ptr;
 
 struct vdIn {
     int fd;
@@ -55,12 +75,16 @@ struct vdIn {
     struct v4l2_format fmt;
     struct v4l2_buffer buf;
     struct v4l2_requestbuffers rb;
+	struct jpeg_decompress_struct cinfo;
+    struct error_mgr_t jerr;
     void *mem[NB_BUFFER];
     unsigned char *tmpbuffer[NB_BUFFER];
     unsigned char *framebuffer[NB_BUFFER];
+	unsigned char *rgbbuffer[NB_BUFFER];
 	int framebuffer_state[NB_BUFFER];
 	int buf_used[NB_BUFFER];
 	int latest_buffer_number;
+	int isjpeg;
     int isstreaming;
     int grabmethod;
     int width;
@@ -98,6 +122,12 @@ int load_controls(int vd);
 	     
 int uvcGrab_left(struct vdIn *vd, int buffer_number);
 int uvcGrab_right(struct vdIn *vd, int buffer_number);
+int uvcGrab_left_rgb(struct vdIn *vd, int buffer_number);
+int uvcGrab_right_rgb(struct vdIn *vd, int buffer_number);
+
+int get_bmp_picture_left(unsigned char *buf, int number);
+int get_bmp_picture_right(unsigned char *buf, int number);
+
 int close_v4l2(struct vdIn *vd);
 
 int v4l2GetControl(struct vdIn *vd, int control);
@@ -114,4 +144,3 @@ int v4l2SetLightFrequencyFilter(struct vdIn *vd,int flt);
 int enum_frame_intervals(int dev, __u32 pixfmt, __u32 width, __u32 height);
 int enum_frame_sizes(int dev, __u32 pixfmt);
 int enum_frame_formats(int dev, unsigned int *supported_formats, unsigned int max_formats);
-

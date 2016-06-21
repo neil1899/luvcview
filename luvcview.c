@@ -265,7 +265,7 @@ static void signal_handler(int signal_number)
    printf("video0 total frames %d, spend time is %lldms\n", total_frames_left, (left_time_end - left_time_start));
    printf("video1 total frames %d, spend time is %lldms\n", total_frames_right, (right_time_end - right_time_start));
    printf("trackre total frames %d, spend time is %lldms\n", total_frames_trackre, (trackre_time_end - trackre_time_start));
-   printf("video0 jpeg total frames %d, spend time is %lldms\n", total_frames_left, jpeg_time_total);
+   printf("video0 jpeg total frames %d, spend time is %lldms-----%llds\n", total_frames_left, jpeg_time_total, jpeg_time_total_1);
 }
 
 int main(int argc, char *argv[])
@@ -1210,7 +1210,7 @@ static int eventthread_camera_left(void *data)
 		SDL_UnlockMutex(trackretex);
 
 		if ( i != NB_BUFFER ) {
-			if (uvcGrab_left_rgb(videoIn, i)/*uvcGrab_left(videoIn, i)*/ < 0) {
+			if (uvcGrab_left_ycbcr(videoIn, i)/*uvcGrab_left(videoIn, i)*/ < 0) {
 				printf("Error grabbing\n");
 				break;
 			} else {
@@ -1278,7 +1278,7 @@ static int eventthread_camera_right(void *data)
 		SDL_UnlockMutex(trackretex);
 
 		if ( i != NB_BUFFER ) {
-			if (uvcGrab_right_rgb(videoIn, i) < 0) {
+			if (uvcGrab_right_ycbcr(videoIn, i) < 0) {
 				printf("Error grabbing\n");
 				break;
 			} else {
@@ -1371,7 +1371,10 @@ static int eventthread_trackre(void *data)
 				switch(videoIn_left->formatIn){
 					case V4L2_PIX_FMT_MJPEG:
 						//get_picture_left(videoIn_left->tmpbuffer[left_buffer_number], videoIn_left->buf_used[left_buffer_number], number_picture);
-						get_bmp_picture_left(videoIn_left->rgbbuffer[left_buffer_number], number_picture);
+						//get_bmp_picture_left(videoIn_left->rgbbuffer[left_buffer_number], number_picture);
+						//get_gray_picture_left(videoIn_left->graybuffer[left_buffer_number], number_picture);
+						get_yuv_picture_left(videoIn_left->graybuffer[left_buffer_number], videoIn_left->cbbuffer[left_buffer_number],
+												videoIn_left->crbuffer[left_buffer_number], number_picture);
 						break;
 					case V4L2_PIX_FMT_YUYV:
 						get_pictureYV2_Left(videoIn_left->framebuffer[left_buffer_number], videoIn_left->width, videoIn_left->height);
@@ -1389,7 +1392,10 @@ static int eventthread_trackre(void *data)
 				switch(videoIn_right->formatIn){
 					case V4L2_PIX_FMT_MJPEG:
 						//get_picture_right(videoIn_right->tmpbuffer[right_buffer_number], videoIn_right->buf_used[right_buffer_number], number_picture);
-						get_bmp_picture_right(videoIn_right->rgbbuffer[right_buffer_number], number_picture);
+						//get_bmp_picture_right(videoIn_right->rgbbuffer[right_buffer_number], number_picture);
+						//get_gray_picture_right(videoIn_right->graybuffer[right_buffer_number], number_picture);
+						get_yuv_picture_right(videoIn_right->graybuffer[right_buffer_number], videoIn_right->cbbuffer[right_buffer_number],
+												videoIn_right->crbuffer[right_buffer_number], number_picture);
 						break;
 					case V4L2_PIX_FMT_YUYV:
 						get_pictureYV2_Right(videoIn_right->framebuffer[right_buffer_number], videoIn_right->width, videoIn_right->height);

@@ -81,6 +81,9 @@ struct vdIn {
     unsigned char *tmpbuffer[NB_BUFFER];
     unsigned char *framebuffer[NB_BUFFER];
 	unsigned char *rgbbuffer[NB_BUFFER];
+	unsigned char *graybuffer[NB_BUFFER];
+	unsigned char *cbbuffer[NB_BUFFER];
+	unsigned char *crbuffer[NB_BUFFER];
 	int framebuffer_state[NB_BUFFER];
 	int buf_used[NB_BUFFER];
 	int latest_buffer_number;

@@ -38,7 +38,9 @@ static int debug_left = 0;
 static int debug_right = 0;
 
 uint64_t jpeg_time_start = 0;
+uint64_t jpeg_time_end_1 = 0;
 uint64_t jpeg_time_end = 0;
+uint64_t jpeg_time_total_1 = 0;
 uint64_t jpeg_time_total = 0;
 
 int post_screen_flag = 0;
@@ -118,6 +120,7 @@ fatal:
 	free(vd->videodevice);
 	return 0;
 }
+
 int
 init_videoIn(struct vdIn *vd, char *device, int width, int height, float fps,
 	     int format, int grabmethod, char *avifilename)
@@ -179,6 +182,15 @@ init_videoIn(struct vdIn *vd, char *device, int width, int height, float fps,
 	    vd->rgbbuffer[i] =
 			(unsigned char *) calloc(1,
 						 (size_t) vd->width * vd->height * 3);
+		vd->graybuffer[i] =
+			(unsigned char *) calloc(1,
+						 (size_t) vd->width * vd->height);
+		vd->cbbuffer[i] =
+			(unsigned char *) calloc(1,
+						 (size_t) (vd->width/2) * (vd->height/2));
+		vd->crbuffer[i] =
+			(unsigned char *) calloc(1,
+						 (size_t) (vd->width/2) * (vd->height/2));
 
 		vd->framebuffer_state[i] = BUFFER_FREE;
 	}
@@ -764,6 +776,86 @@ static void write_pixel_data(unsigned char *output_buffer, FILE *output_file)
     free(pdata);
 }
 
+int get_yuv_picture_left(unsigned char *ybuf, unsigned char *cbbuf,
+										unsigned char *crbuf, int number)
+{
+	FILE *file;
+	int step = 640 * 480;
+	int chroma = 320 * 240;
+	char *name = NULL;
+	name = calloc(80,1);
+	snprintf(name, 26, "/tmp/Left-P-%d.%s\0", number, "yuv");
+	file = fopen(name, "wb");
+	if (file != NULL) {
+		fwrite(ybuf, 1, step, file);
+		fwrite(cbbuf, 1, chroma, file);
+		fwrite(crbuf, 1, chroma, file);
+		fclose(file);
+		if(name)
+			free(name);
+		return 0;
+	}
+}
+
+int get_yuv_picture_right(unsigned char *ybuf, unsigned char *cbbuf,
+										unsigned char *crbuf, int number)
+{
+	FILE *file;
+	int step = 640 * 480;
+	int chroma = 320 * 240;
+	char *name = NULL;
+	name = calloc(80,1);
+	snprintf(name, 26, "/tmp/Right-P-%d.%s\0", number, "yuv");
+	file = fopen(name, "wb");
+	if (file != NULL) {
+		fwrite(ybuf, 1, step, file);
+		fwrite(cbbuf, 1, chroma, file);
+		fwrite(crbuf, 1, chroma, file);
+		fclose(file);
+		if(name)
+			free(name);
+		return 0;
+	}
+}
+
+int get_gray_picture_left(unsigned char *buf, int number)
+{
+	FILE *file;
+	unsigned char *ptdeb,*ptcur = buf;
+	int sizein;
+	int step = 640 * 480;
+	char *name = NULL;
+	name = calloc(80,1);
+	snprintf(name, 26, "/tmp/Left-P-%d.%s\0", number, "yuv");
+	file = fopen(name, "wb");
+	if (file != NULL) {
+		fwrite(buf, 1, step, file);
+		fclose(file);
+		if(name)
+			free(name);
+		return 0;
+	}
+}
+
+int get_gray_picture_right(unsigned char *buf, int number)
+{
+	FILE *file;
+	unsigned char *ptdeb,*ptcur = buf;
+	int sizein;
+	int step = 640 * 480;
+	char *name = NULL;
+	name = calloc(80,1);
+	snprintf(name, 26, "/tmp/Right-P-%d.%s\0", number, "yuv");
+	file = fopen(name, "wb");
+	if (file != NULL) {
+		fwrite(buf, 1, step, file);
+		fclose(file);
+		if(name)
+			free(name);
+		return 0;
+	}
+}
+
 int get_bmp_picture_left(unsigned char *buf, int number)
 {
 	FILE *file;
@@ -800,6 +892,414 @@ int get_bmp_picture_right(unsigned char *buf, int number)
 			free(name);
 		return 0;
 	}
+}
+
+int uvcGrab_left_ycbcr(struct vdIn *vd, int buffer_number)
+{
+#define HEADERFRAME1 0xaf
+	int ret;
+    int row_stride;       	  /* physical row width in output buffer */
+    JSAMPARRAY buffer;        /* Output row buffer */
+	unsigned char *next_pos = NULL;
+
+	int x, y;
+    int yMask, xMask;
+	unsigned char *yPtr, *uPtr, *vPtr, *rgbPixels;
+
+	if (!vd->isstreaming) {
+		if (video_enable_left(vd))
+			goto err;
+	}
+
+	if (!vd->isjpeg) {
+		if (jpeg_decode_left_init(vd))
+			goto err;
+	}
+
+	memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
+	vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	vd->buf.memory = V4L2_MEMORY_MMAP;
+	ret = ioctl(vd->fd, VIDIOC_DQBUF, &vd->buf);
+
+	if (ret < 0) {
+		perror("Unable to dequeue buffer");
+		goto err;
+	}
+
+	switch (vd->formatIn) {
+	case V4L2_PIX_FMT_MJPEG:
+		if(vd->buf.bytesused <= HEADERFRAME1) { /* Prevent crash on empty image */
+			printf("Ignoring empty buffer ...\n");
+			return 0;
+		}
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+
+		jpeg_time_start = jpeg_getmicrosecs64_internal()/1000;
+    	jpeg_mem_src(&vd->cinfo, vd->mem[vd->buf.index], vd->buf.bytesused);
+    	(void) jpeg_read_header(&vd->cinfo, TRUE);
+
+		vd->cinfo.out_color_space = JCS_YCbCr;
+
+    	(void) jpeg_start_decompress(&vd->cinfo);
+
+    	next_pos = vd->rgbbuffer[buffer_number];
+    	row_stride = vd->cinfo.output_width * vd->cinfo.output_components;
+
+    	buffer = (*vd->cinfo.mem->alloc_sarray)((j_common_ptr)&vd->cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    	while (vd->cinfo.output_scanline < vd->cinfo.output_height) {
+	        (void) jpeg_read_scanlines(&vd->cinfo, buffer, 1);
+	        memcpy(next_pos, *buffer, vd->cinfo.output_width*vd->cinfo.output_components);
+	        next_pos += vd->cinfo.output_width*vd->cinfo.output_components;
+    	}
+		jpeg_time_end_1 = jpeg_getmicrosecs64_internal()/1000;
+
+		yMask = xMask = 1;
+
+		rgbPixels = vd->rgbbuffer[buffer_number];
+		yPtr = vd->graybuffer[buffer_number];
+		uPtr = vd->cbbuffer[buffer_number];
+		vPtr = vd->crbuffer[buffer_number];
+
+		for(y=0; y<vd->cinfo.output_height; y++)
+		{
+			for(x=0; x<vd->cinfo.output_width; x++)
+			{
+				*yPtr++ = *rgbPixels++;
+				if((y & yMask) == 0 && (x & xMask) == 0){
+					*uPtr++ = *rgbPixels++;
+					*vPtr++ = *rgbPixels++;
+				}
+				else
+					rgbPixels += 2;
+			}
+		}
+
+		(void)jpeg_finish_decompress(&vd->cinfo);
+		jpeg_time_end = jpeg_getmicrosecs64_internal()/1000;
+
+		jpeg_time_total += (jpeg_time_end - jpeg_time_start);
+		jpeg_time_total_1 += (jpeg_time_end_1 - jpeg_time_start);
+
+		if (debug_left)
+			printf("bytes in used %d\n", vd->buf.bytesused);
+
+		if (post_screen_flag) {
+			memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index], vd->buf.bytesused);
+			if (jpeg_decode_left(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
+				 &vd->height) < 0) {
+				printf("jpeg decode errors\n");
+				goto err;
+			}
+		}
+	break;
+
+	default:
+		goto err;
+	break;
+	}
+
+	ret = ioctl(vd->fd, VIDIOC_QBUF, &vd->buf);
+	if (ret < 0) {
+		perror("Unable to requeue buffer");
+		goto err;
+	}
+
+	return 0;
+  err:
+	vd->signalquit = 0;
+	return -1;
+}
+
+int uvcGrab_right_ycbcr(struct vdIn *vd, int buffer_number)
+{
+#define HEADERFRAME1 0xaf
+	int ret;
+    int row_stride;       	  /* physical row width in output buffer */
+    JSAMPARRAY buffer;        /* Output row buffer */
+	unsigned char *next_pos = NULL;
+
+	int x, y;
+    int yMask, xMask;
+	unsigned char *yPtr, *uPtr, *vPtr, *rgbPixels;
+
+	if (!vd->isstreaming) {
+		if (video_enable_right(vd))
+			goto err;
+	}
+
+	if (!vd->isjpeg) {
+		if (jpeg_decode_right_init(vd))
+			goto err;
+	}
+
+	memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
+	vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	vd->buf.memory = V4L2_MEMORY_MMAP;
+	ret = ioctl(vd->fd, VIDIOC_DQBUF, &vd->buf);
+
+	if (ret < 0) {
+		perror("Unable to dequeue buffer");
+		goto err;
+	}
+
+	switch (vd->formatIn) {
+	case V4L2_PIX_FMT_MJPEG:
+		if(vd->buf.bytesused <= HEADERFRAME1) { /* Prevent crash on empty image */
+			printf("Ignoring empty buffer ...\n");
+			return 0;
+		}
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+
+    	jpeg_mem_src(&vd->cinfo, vd->mem[vd->buf.index], vd->buf.bytesused);
+    	(void) jpeg_read_header(&vd->cinfo, TRUE);
+
+		vd->cinfo.out_color_space = JCS_YCbCr;
+
+    	(void) jpeg_start_decompress(&vd->cinfo);
+
+    	next_pos = vd->rgbbuffer[buffer_number];
+    	row_stride = vd->cinfo.output_width * vd->cinfo.output_components;
+
+    	buffer = (*vd->cinfo.mem->alloc_sarray)((j_common_ptr)&vd->cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    	while (vd->cinfo.output_scanline < vd->cinfo.output_height) {
+	        (void) jpeg_read_scanlines(&vd->cinfo, buffer, 1);
+	        memcpy(next_pos, *buffer, vd->cinfo.output_width*vd->cinfo.output_components);
+	        next_pos += vd->cinfo.output_width*vd->cinfo.output_components;
+    	}
+
+		yMask = xMask = 1;
+
+		rgbPixels = vd->rgbbuffer[buffer_number];
+		yPtr = vd->graybuffer[buffer_number];
+		uPtr = vd->cbbuffer[buffer_number];
+		vPtr = vd->crbuffer[buffer_number];;
+
+		for(y = 0; y < vd->cinfo.output_height; y++)
+		{
+			for(x = 0; x < vd->cinfo.output_width; x++)
+			{
+				*yPtr++ = *rgbPixels++;
+				if((y & yMask) == 0 && (x & xMask) == 0){
+					*uPtr++ = *rgbPixels++;
+					*vPtr++ = *rgbPixels++;
+				}
+				else
+					rgbPixels += 2;
+			}
+		}
+
+		(void)jpeg_finish_decompress(&vd->cinfo);
+
+		if (debug_left)
+			printf("bytes in used %d\n", vd->buf.bytesused);
+
+		if (post_screen_flag) {
+			memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index], vd->buf.bytesused);
+			if (jpeg_decode_right(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
+				 &vd->height) < 0) {
+				printf("jpeg decode errors\n");
+				goto err;
+			}
+		}
+	break;
+
+	default:
+		goto err;
+	break;
+	}
+
+	ret = ioctl(vd->fd, VIDIOC_QBUF, &vd->buf);
+	if (ret < 0) {
+		perror("Unable to requeue buffer");
+		goto err;
+	}
+
+	return 0;
+  err:
+	vd->signalquit = 0;
+	return -1;
+}
+
+int uvcGrab_left_grey(struct vdIn *vd, int buffer_number)
+{
+#define HEADERFRAME1 0xaf
+	int ret;
+    int row_stride;       	  /* physical row width in output buffer */
+    JSAMPARRAY buffer;        /* Output row buffer */
+	unsigned char *next_pos = NULL;
+
+	if (!vd->isstreaming) {
+		if (video_enable_left(vd))
+			goto err;
+	}
+
+	if (!vd->isjpeg) {
+		if (jpeg_decode_left_init(vd))
+			goto err;
+	}
+
+	//jpeg_decode_left_init(vd);
+	memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
+	vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	vd->buf.memory = V4L2_MEMORY_MMAP;
+	ret = ioctl(vd->fd, VIDIOC_DQBUF, &vd->buf);
+
+	if (ret < 0) {
+		perror("Unable to dequeue buffer");
+		goto err;
+	}
+
+	switch (vd->formatIn) {
+	case V4L2_PIX_FMT_MJPEG:
+		if(vd->buf.bytesused <= HEADERFRAME1) { /* Prevent crash on empty image */
+			printf("Ignoring empty buffer ...\n");
+			return 0;
+		}
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+
+		jpeg_time_start = jpeg_getmicrosecs64_internal()/1000;
+    	jpeg_mem_src(&vd->cinfo, vd->mem[vd->buf.index], vd->buf.bytesused);
+    	(void) jpeg_read_header(&vd->cinfo, TRUE);
+
+		vd->cinfo.out_color_space = JCS_GRAYSCALE;
+
+    	(void) jpeg_start_decompress(&vd->cinfo);
+
+    	next_pos = vd->graybuffer[buffer_number];
+    	row_stride = vd->cinfo.output_width * vd->cinfo.output_components;
+
+    	buffer = (*vd->cinfo.mem->alloc_sarray)((j_common_ptr)&vd->cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    	while (vd->cinfo.output_scanline < vd->cinfo.output_height) {
+	        (void) jpeg_read_scanlines(&vd->cinfo, buffer, 1);
+	        memcpy(next_pos, *buffer, vd->cinfo.output_width*vd->cinfo.output_components);
+	        next_pos += vd->cinfo.output_width*vd->cinfo.output_components;
+    	}
+		(void)jpeg_finish_decompress(&vd->cinfo);
+		jpeg_time_end = jpeg_getmicrosecs64_internal()/1000;
+
+		jpeg_time_total += (jpeg_time_end - jpeg_time_start);
+
+		if (debug_left)
+			printf("bytes in used %d\n", vd->buf.bytesused);
+
+		if (post_screen_flag) {
+			memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index], vd->buf.bytesused);
+			if (jpeg_decode_left(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
+				 &vd->height) < 0) {
+				printf("jpeg decode errors\n");
+				goto err;
+			}
+		}
+	break;
+
+	default:
+		goto err;
+	break;
+	}
+
+	ret = ioctl(vd->fd, VIDIOC_QBUF, &vd->buf);
+	if (ret < 0) {
+		perror("Unable to requeue buffer");
+		goto err;
+	}
+
+	return 0;
+  err:
+	vd->signalquit = 0;
+	return -1;
+}
+
+int uvcGrab_right_grey(struct vdIn *vd, int buffer_number)
+{
+#define HEADERFRAME1 0xaf
+	int ret;
+    int row_stride;       	  /* physical row width in output buffer */
+    JSAMPARRAY buffer;        /* Output row buffer */
+	unsigned char *next_pos = NULL;
+
+	if (!vd->isstreaming) {
+		if (video_enable_left(vd))
+			goto err;
+	}
+
+	if (!vd->isjpeg) {
+		if (jpeg_decode_left_init(vd))
+			goto err;
+	}
+
+	//jpeg_decode_left_init(vd);
+	memset(&vd->buf, 0, sizeof(struct v4l2_buffer));
+	vd->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	vd->buf.memory = V4L2_MEMORY_MMAP;
+	ret = ioctl(vd->fd, VIDIOC_DQBUF, &vd->buf);
+
+	if (ret < 0) {
+		perror("Unable to dequeue buffer");
+		goto err;
+	}
+
+	switch (vd->formatIn) {
+	case V4L2_PIX_FMT_MJPEG:
+		if(vd->buf.bytesused <= HEADERFRAME1) { /* Prevent crash on empty image */
+			printf("Ignoring empty buffer ...\n");
+			return 0;
+		}
+		vd->buf_used[buffer_number] = vd->buf.bytesused;
+
+		jpeg_time_start = jpeg_getmicrosecs64_internal()/1000;
+    	jpeg_mem_src(&vd->cinfo, vd->mem[vd->buf.index], vd->buf.bytesused);
+    	(void) jpeg_read_header(&vd->cinfo, TRUE);
+
+		vd->cinfo.out_color_space = JCS_GRAYSCALE;
+
+    	(void) jpeg_start_decompress(&vd->cinfo);
+
+    	next_pos = vd->graybuffer[buffer_number];
+    	row_stride = vd->cinfo.output_width * vd->cinfo.output_components;
+
+    	buffer = (*vd->cinfo.mem->alloc_sarray)((j_common_ptr)&vd->cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    	while (vd->cinfo.output_scanline < vd->cinfo.output_height) {
+	        (void) jpeg_read_scanlines(&vd->cinfo, buffer, 1);
+	        memcpy(next_pos, *buffer, vd->cinfo.output_width*vd->cinfo.output_components);
+	        next_pos += vd->cinfo.output_width*vd->cinfo.output_components;
+    	}
+		(void)jpeg_finish_decompress(&vd->cinfo);
+		jpeg_time_end = jpeg_getmicrosecs64_internal()/1000;
+
+		jpeg_time_total += (jpeg_time_end - jpeg_time_start);
+
+		if (debug_left)
+			printf("bytes in used %d\n", vd->buf.bytesused);
+
+		if (post_screen_flag) {
+			memcpy(vd->tmpbuffer[buffer_number], vd->mem[vd->buf.index], vd->buf.bytesused);
+			if (jpeg_decode_left(&vd->framebuffer[buffer_number], vd->tmpbuffer[buffer_number], &vd->width,
+				 &vd->height) < 0) {
+				printf("jpeg decode errors\n");
+				goto err;
+			}
+		}
+	break;
+
+	default:
+		goto err;
+	break;
+	}
+
+	ret = ioctl(vd->fd, VIDIOC_QBUF, &vd->buf);
+	if (ret < 0) {
+		perror("Unable to requeue buffer");
+		goto err;
+	}
+
+	return 0;
+  err:
+	vd->signalquit = 0;
+	return -1;
 }
 
 int uvcGrab_left_rgb(struct vdIn *vd, int buffer_number)

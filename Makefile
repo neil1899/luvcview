@@ -10,9 +10,11 @@ INSTALL=install
 APP_BINARY=luvcview
 BIN=/usr/local/bin
 MATH_LIB = -lm
-JPEG_LIB = -ljpeg
+JPEG_LIB = -ljpeg -lstdc++
 SDLLIBS = $(shell sdl-config --libs) 
 SDLFLAGS = $(shell sdl-config --cflags)
+OPENCVLIBS = $(shell pkg-config --libs --static opencv)
+TRACKRELIBS = -L./ -lTriangluarTracker
 #LIBX11FLAGS= -I/usr/X11R6/include -L/usr/X11R6/lib
 VERSION = 0.2.6
 
@@ -29,7 +31,6 @@ CPPFLAGS = $(CFLAGS)
 
 OBJECTS= luvcview.o color.o utils.o v4l2uvc.o gui.o avilib.o
 		
-
 all:	luvcview
 
 clean:
@@ -42,9 +43,10 @@ luvcview:	$(OBJECTS)
 		$(MATH_LIB) \
 		$(SDLLIBS)\
 		$(JPEG_LIB)\
+		$(OPENCVLIBS)\
+		$(TRACKRELIBS)\
 		-o $(APP_BINARY)
 	chmod 755 $(APP_BINARY)
-
 
 install: luvcview
 	$(INSTALL) -s -m 755 -g root -o root $(APP_BINARY) $(BIN) 

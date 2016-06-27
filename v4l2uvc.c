@@ -709,7 +709,7 @@ static void write_bmp_header(FILE *output_file)
 
     /* File size */
     headersize = 14 + 40 + cmap_entries * 4; /* Header and colormap */
-    bfSize = headersize + (long) step * 360;
+    bfSize = headersize + (long) step * 480;
     /* Set unused fields of header to 0 */
     memset(bmpfileheader, 0, sizeof(char)*14);
     memset(bmpinfoheader, 0 ,sizeof(char)*40);
@@ -725,7 +725,7 @@ static void write_bmp_header(FILE *output_file)
 
     PUT_4B(bmpinfoheader, 4, 640);
 
-    PUT_4B(bmpinfoheader, 8, 360);
+    PUT_4B(bmpinfoheader, 8, 480);
 
     PUT_2B(bmpinfoheader, 12, 1);
 
@@ -762,8 +762,8 @@ static void write_pixel_data(unsigned char *output_buffer, FILE *output_file)
     unsigned char *pdata = (unsigned char *)malloc(step);
     memset(pdata, 0, step);
 
-    unsigned char *tmp = output_buffer + row_width * (360 - 1);
-    for (rows = 0; rows < 360; rows++) {
+    unsigned char *tmp = output_buffer + row_width * (480 - 1);
+    for (rows = 0; rows < 480; rows++) {
         for (cols = 0; cols < row_width; cols += 3) {
             pdata[cols + 2] = tmp[cols + 0];
             pdata[cols + 1] = tmp[cols + 1];

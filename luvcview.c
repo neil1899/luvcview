@@ -43,6 +43,10 @@
 #include <signal.h>
 #include <X11/Xlib.h>
 #include <SDL/SDL_syswm.h>
+#include <netdb.h>
+#include <stdbool.h>
+#include <netinet/in.h>
+#include <net/if.h>
 #include "v4l2uvc.h"
 #include "gui.h"
 #include "utils.h"
@@ -199,8 +203,30 @@ static int total_frames_right = 0;
 static int total_frames_trackre = 0;
 
 extern uint64_t jpeg_time_total;
+extern uint64_t jpeg_time_total_1;
 
 extern int post_screen_flag;
+
+struct stTrackRes
+{
+    char padding_start[72];
+
+    char verification_code[4];
+    float pts3d[6];
+    int flag[2];
+    int marker_num;
+    float time;
+
+    char padding_end[144];
+};
+
+struct stTrackRes tracker_data;
+uint64_t time_start = -1;
+
+void *tracker_ptr = NULL;
+void *create_tracker();
+void release_tracker(void* ptr_tracker);
+bool track(void* ptr_tracker, unsigned char* ptr_image1, unsigned char* ptr_image2, int width, int height, struct stTrackRes *output);
 
 static uint64_t vcos_getmicrosecs64_internal(void)
 {
@@ -244,6 +270,7 @@ struct pt_camera_data {
 struct pt_trackre_data {
     struct vdIn *ptvideoIn_left;
 	struct vdIn *ptvideoIn_right;
+	SDL_mutex *trackretex;
 	SDL_mutex *trackretex_left;
 	SDL_mutex *trackretex_right;
 } pt_common_trackre_data;
@@ -255,6 +282,121 @@ static int eventthread_trackre(void *data);
 
 static Uint32 SDL_VIDEO_Flags =
     SDL_ANYFORMAT | SDL_DOUBLEBUF | SDL_RESIZABLE;
+
+int sockfd_single;
+unsigned int socklen_single;
+
+struct sockaddr_in myaddr;
+struct sockaddr_in singleaddr;
+
+int getlocalip(char *wlanip)
+{
+	int i=0;
+	int sockfd;
+	struct ifconf ifconf;
+	struct ifreq *ifreq;
+
+	char buf[1024] = {0};
+	char* ip = NULL;
+	int find_wlan = 0;
+
+	while (1) {
+		ifconf.ifc_len = 1024;
+        ifconf.ifc_buf = buf;
+
+		if((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+        {
+            printf("get_localip error\n");
+            return -1;
+        }
+
+		ioctl(sockfd, SIOCGIFCONF, &ifconf);
+		ifreq = (struct ifreq*)buf;
+
+		if(ifreq->ifr_flags == AF_INET) {
+			for(i=(ifconf.ifc_len/sizeof(struct ifreq)); i>0; i--)
+			{
+				if(strcmp(ifreq->ifr_name, "wlan0") != 0)
+				{
+					printf("can't find wlan0\n");
+					ifreq++;
+                                        find_wlan = 0;
+				} else {
+					printf("can find wlan0\n");
+					find_wlan = 1;
+				}
+			}
+
+			if (find_wlan) {
+				ip = inet_ntoa(((struct sockaddr_in*)&(ifreq->ifr_addr))->sin_addr);
+				if (ip != NULL) {
+					printf("wlan ip addr is [%s]\n", ip);
+					strcpy(wlanip, ip);
+					break;
+				}
+			}
+		}
+		printf("try again\n");
+		close(sockfd);
+		sockfd = -1;
+		sleep(2);
+	}
+
+	close(sockfd);
+	sockfd = -1;
+
+	if (ip != NULL) {
+		return 0;
+	} else {
+		return -1;
+	}
+}
+
+int single_udp(void)
+{
+	if ((sockfd_single = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+	{
+		printf("single_udp socket error\n");
+		return -1;
+	}
+
+	socklen_single = sizeof(struct sockaddr_in);
+	memset(&singleaddr, 0, socklen_single);
+
+	singleaddr.sin_family = AF_INET;
+	singleaddr.sin_port = htons(8888);
+	singleaddr.sin_addr.s_addr = inet_addr("192.168.1.140");
+
+	return 0;
+}
+
+int network_init(void)
+{
+   int res = 0;
+   char wlan_ip[20] = {0};
+
+   res = getlocalip(wlan_ip);
+   if (res != 0) {
+      return -1;
+   }
+
+   res = single_udp();
+   if (res != 0) {
+      return -1;
+   }
+
+   memset(&myaddr, 0, sizeof(struct sockaddr_in));
+   myaddr.sin_family = AF_INET;
+   myaddr.sin_port = htons(25556);
+
+   if(inet_pton(AF_INET, wlan_ip, &myaddr.sin_addr) <= 0)
+   {
+	   printf("self ip address error!\n");
+	   return -1;
+   }
+
+   return res;
+}
 
 static void signal_handler(int signal_number)
 {
@@ -294,7 +436,7 @@ int main(int argc, char *argv[])
 	const char *videodevice_right = "/dev/video1";
 
 	int width = 640;
-	int height = 360;
+	int height = 480;
 	float fps = 60.0;			// Requested frame rate
 	int format = V4L2_PIX_FMT_MJPEG;
 
@@ -316,7 +458,18 @@ int main(int argc, char *argv[])
 
 	printf("luvcview %s\n\n", version);
 
+	if (network_init() == -1) {
+	   printf("Failed to setup network");
+	}
+
 	signal(SIGINT, signal_handler);
+
+	tracker_ptr = create_tracker();
+	tracker_data.verification_code[0] = 0x01;
+	tracker_data.verification_code[1] = 0x02;
+	tracker_data.verification_code[2] = 0x03;
+	tracker_data.verification_code[3] = 0x04;
+	time_start = vcos_getmicrosecs64_internal()/1000;
 
 	for (i = 1; i < argc; i++)
 	{
@@ -622,6 +775,7 @@ int main(int argc, char *argv[])
 
 	pt_common_trackre_data.ptvideoIn_left = videoIn_left;
 	pt_common_trackre_data.ptvideoIn_right = videoIn_right;
+	pt_common_trackre_data.trackretex = affmutex;
 	pt_common_trackre_data.trackretex_left = trackre_left;
 	pt_common_trackre_data.trackretex_right = trackre_right;
 
@@ -664,6 +818,7 @@ int main(int argc, char *argv[])
 	destroyButt();
 	freeLut_Left();
 	freeLut_Right();
+	release_tracker(tracker_ptr);
 	printf("Cleanup done. Exiting ...\n");
 	SDL_Quit();
 }
@@ -1210,7 +1365,7 @@ static int eventthread_camera_left(void *data)
 		SDL_UnlockMutex(trackretex);
 
 		if ( i != NB_BUFFER ) {
-			if (uvcGrab_left_ycbcr(videoIn, i)/*uvcGrab_left(videoIn, i)*/ < 0) {
+			if (uvcGrab_left_rgb(videoIn, i)/*uvcGrab_left(videoIn, i)*/ < 0) {
 				printf("Error grabbing\n");
 				break;
 			} else {
@@ -1278,7 +1433,7 @@ static int eventthread_camera_right(void *data)
 		SDL_UnlockMutex(trackretex);
 
 		if ( i != NB_BUFFER ) {
-			if (uvcGrab_right_ycbcr(videoIn, i) < 0) {
+			if (uvcGrab_right_rgb(videoIn, i) < 0) {
 				printf("Error grabbing\n");
 				break;
 			} else {
@@ -1320,12 +1475,6 @@ static int eventthread_camera_right(void *data)
 	}
 }
 
-void call_trackre(void)
-{
-	//TODO
-	;
-}
-
 static int eventthread_trackre(void *data)
 {
 	int i = 0;
@@ -1337,8 +1486,10 @@ static int eventthread_trackre(void *data)
 	struct pt_trackre_data *gdata = (struct pt_trackre_data *)data;
 	struct vdIn *videoIn_left = gdata->ptvideoIn_left;
 	struct vdIn *videoIn_right = gdata->ptvideoIn_right;
+	SDL_mutex *trackretex = gdata->trackretex;
 	SDL_mutex *trackretex_left = gdata->trackretex_left;
 	SDL_mutex *trackretex_right = gdata->trackretex_right;
+	char info[256];
 
 	if (trackre_time_start == -1) {
 	   trackre_time_start = vcos_getmicrosecs64_internal()/1000;
@@ -1371,10 +1522,10 @@ static int eventthread_trackre(void *data)
 				switch(videoIn_left->formatIn){
 					case V4L2_PIX_FMT_MJPEG:
 						//get_picture_left(videoIn_left->tmpbuffer[left_buffer_number], videoIn_left->buf_used[left_buffer_number], number_picture);
-						//get_bmp_picture_left(videoIn_left->rgbbuffer[left_buffer_number], number_picture);
+						get_bmp_picture_left(videoIn_left->rgbbuffer[left_buffer_number], number_picture);
 						//get_gray_picture_left(videoIn_left->graybuffer[left_buffer_number], number_picture);
-						get_yuv_picture_left(videoIn_left->graybuffer[left_buffer_number], videoIn_left->cbbuffer[left_buffer_number],
-												videoIn_left->crbuffer[left_buffer_number], number_picture);
+						//get_yuv_picture_left(videoIn_left->graybuffer[left_buffer_number], videoIn_left->cbbuffer[left_buffer_number],
+						//						videoIn_left->crbuffer[left_buffer_number], number_picture);
 						break;
 					case V4L2_PIX_FMT_YUYV:
 						get_pictureYV2_Left(videoIn_left->framebuffer[left_buffer_number], videoIn_left->width, videoIn_left->height);
@@ -1392,10 +1543,10 @@ static int eventthread_trackre(void *data)
 				switch(videoIn_right->formatIn){
 					case V4L2_PIX_FMT_MJPEG:
 						//get_picture_right(videoIn_right->tmpbuffer[right_buffer_number], videoIn_right->buf_used[right_buffer_number], number_picture);
-						//get_bmp_picture_right(videoIn_right->rgbbuffer[right_buffer_number], number_picture);
+						get_bmp_picture_right(videoIn_right->rgbbuffer[right_buffer_number], number_picture);
 						//get_gray_picture_right(videoIn_right->graybuffer[right_buffer_number], number_picture);
-						get_yuv_picture_right(videoIn_right->graybuffer[right_buffer_number], videoIn_right->cbbuffer[right_buffer_number],
-												videoIn_right->crbuffer[right_buffer_number], number_picture);
+						//get_yuv_picture_right(videoIn_right->graybuffer[right_buffer_number], videoIn_right->cbbuffer[right_buffer_number],
+						//						videoIn_right->crbuffer[right_buffer_number], number_picture);
 						break;
 					case V4L2_PIX_FMT_YUYV:
 						get_pictureYV2_Right(videoIn_right->framebuffer[right_buffer_number], videoIn_right->width, videoIn_right->height);
@@ -1411,7 +1562,23 @@ static int eventthread_trackre(void *data)
 		}
 
 		if (left_flag && right_flag) {
-			call_trackre();
+			tracker_data.time = (float)(vcos_getmicrosecs64_internal()/1000 - time_start);
+			track(tracker_ptr, videoIn_left->rgbbuffer[left_buffer_number],
+							videoIn_right->rgbbuffer[right_buffer_number], videoIn_left->width, videoIn_left->height, &tracker_data);
+
+			if (sendto(sockfd_single, (void *)&tracker_data, sizeof(tracker_data), 0, (struct sockaddr *)&singleaddr,
+				  sizeof(struct sockaddr_in)) < 0){
+			   printf("single sendto error!\n");
+			}
+
+			sprintf(info, "%d  (%d %.1f %.1f %.1f)-(%d %.1f %.1f %.1f)", tracker_data.marker_num, tracker_data.flag[0], tracker_data.pts3d[0], tracker_data.pts3d[1], tracker_data.pts3d[2], tracker_data.flag[1], tracker_data.pts3d[3], tracker_data.pts3d[4], tracker_data.pts3d[5]);
+
+			if (post_screen_flag) {
+				SDL_LockMutex(trackretex);
+				SDL_WM_SetCaption(info, NULL);
+				SDL_UnlockMutex(trackretex);
+			}
+
 			total_frames_trackre++;
 			SDL_LockMutex(trackretex_left);
 			for (i=0; i<NB_BUFFER; i++) {
